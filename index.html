@@ -1,0 +1,2716 @@
+import React, { useState, useEffect, useCallback, Fragment } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getFirestore, doc, addDoc, setDoc, updateDoc, onSnapshot, collection, query, deleteDoc, getDoc, writeBatch, getDocs, orderBy } from 'firebase/firestore';
+
+// --- Global Firebase Configuration ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'satria-novel-app';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+const APP_VERSION = 'v1.9.15 (Perbaikan Tanda Petik & JSON)'; // UPDATED: Application Version
+
+// --- Firebase Initialization ---
+let firebaseApp;
+let db;
+let auth;
+
+try {
+  firebaseApp = initializeApp(firebaseConfig);
+  db = getFirestore(firebaseApp);
+  auth = getAuth(firebaseApp);
+} catch (error) {
+  console.error("Firebase initialization error:", error);
+}
+
+// --- Utility Functions ---
+
+const applyWordFilter = (text, filterString) => {
+    if (!filterString || !text) return text;
+    const filterWords = filterString.split(',').map(w => w.trim()).filter(Boolean);
+    if (filterWords.length === 0) return text;
+    const regex = new RegExp(filterWords.join('|'), 'gi');
+    return text.replace(regex, match => '*'.repeat(match.length));
+};
+
+const cleanTextFormat = (text) => {
+    if (!text) return "";
+    return text
+        .replace(/\*\*/g, '') 
+        .replace(/\*/g, '')   
+        .replace(/__/g, '')   
+        .trim();
+};
+
+const parseAIResponse = (text) => {
+    if (!text) return null;
+    try {
+        // 1. Coba parse langsung
+        return JSON.parse(text);
+    } catch (initialError) {
+        try {
+            // 2. Bersihkan markdown tick jika ada
+            let cleanText = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+            return JSON.parse(cleanText);
+        } catch (secondError) {
+            // 3. Fallback: Ekstrak manual objek/array JSON pertama menggunakan token parser
+            try {
+                let startIndex = text.indexOf('{');
+                let startBracket = text.indexOf('[');
+                let isArray = false;
+                
+                if (startBracket !== -1 && (startIndex === -1 || startBracket < startIndex)) {
+                    startIndex = startBracket;
+                    isArray = true;
+                }
+
+                if (startIndex !== -1) {
+                    let openChar = isArray ? '[' : '{';
+                    let closeChar = isArray ? ']' : '}';
+                    let depth = 0;
+                    let endIndex = -1;
+                    let inString = false;
+                    let escapeNext = false;
+
+                    for (let i = startIndex; i < text.length; i++) {
+                        let char = text[i];
+                        if (escapeNext) {
+                            escapeNext = false;
+                            continue;
+                        }
+                        if (char === '\\') {
+                            escapeNext = true;
+                            continue;
+                        }
+                        if (char === '"') {
+                            inString = !inString;
+                            continue;
+                        }
+                        if (!inString) {
+                            if (char === openChar) depth++;
+                            else if (char === closeChar) {
+                                depth--;
+                                if (depth === 0) {
+                                    endIndex = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (endIndex !== -1) {
+                        let jsonStr = text.substring(startIndex, endIndex + 1);
+                        return JSON.parse(jsonStr);
+                    }
+                }
+            } catch (thirdError) {
+                console.error("Advanced parsing failed", thirdError);
+            }
+            
+            console.error("JSON Parse Error, falling back to raw text", initialError);
+            return null;
+        }
+    }
+};
+
+const countWords = (text) => {
+    if (!text) return 0;
+    return text.trim().split(/\s+/).filter(Boolean).length;
+};
+
+const cleanContentForPrint = (text, novelFootnote, episodeTitle = "") => {
+    if (!text) return "";
+    let cleaned = text;
+
+    // NEW: Hapus pengulangan judul di awal baris (akibat AI yang menuliskannya lagi di dalam konten)
+    if (episodeTitle) {
+        let lines = cleaned.split(/\n/).map(l => l.trim()).filter(Boolean);
+        if (lines.length > 0) {
+            let firstLine = lines[0].replace(/[*_]/g, '').toLowerCase();
+            let cleanTitle = episodeTitle.toLowerCase().replace(/^episode\s*\d+[:\-\s]*/i, '').trim();
+            
+            // Cek apakah baris pertama adalah judul (atau sangat mirip)
+            if (firstLine === cleanTitle || firstLine === episodeTitle.toLowerCase() || (cleanTitle.length > 5 && firstLine.includes(cleanTitle))) {
+                // Cari indeks kemunculan baris ini dan potong
+                let rawFirstLine = cleaned.split(/\n/).find(l => l.trim().length > 0);
+                if (rawFirstLine) {
+                    cleaned = cleaned.substring(cleaned.indexOf(rawFirstLine) + rawFirstLine.length).trim();
+                }
+            }
+        }
+    }
+
+    // 1. Hapus semua tagar/hashtag (misal: #suyatnoabubakar, #tag1)
+    cleaned = cleaned.replace(/#[^\s#]+/g, '');
+
+    // 2. Hapus footnote spesifik dari novel (jika ada)
+    if (novelFootnote && novelFootnote.trim()) {
+        const escapedFootnote = novelFootnote.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const footnoteRegex = new RegExp(escapedFootnote, 'gi');
+        cleaned = cleaned.replace(footnoteRegex, '');
+    }
+
+    // 3. SAPU BERSIH: Hapus kalimat penutup/CTA (Call to Action) spesifik buatan AI
+    cleaned = cleaned.replace(/Like,\s*Share,\s*dan\s*Komentar\s*dulu\s*biar\s*lanjutannya\s*makin\s*seru!{0,3}/gi, '');
+    cleaned = cleaned.replace(/Jangan\s*lupa\s*Like,\s*Share.*$/gmi, '');
+
+    // 4. POTONG AKHIR BERSAMBUNG: Temukan kata "Bersambung" di bagian penutup episode (maks 300 karakter terakhir).
+    // Jika ketemu, potong/buang kata tersebut BERSERTA semua teks di bawahnya (seperti sisa pesan dari AI).
+    const lowerCleaned = cleaned.toLowerCase();
+    const bersambungIndex = lowerCleaned.lastIndexOf('bersambung');
+    
+    if (bersambungIndex !== -1 && (cleaned.length - bersambungIndex) < 300) {
+         // Mundurkan index sedikit untuk menghapus spasi atau simbol (*, _) persis sebelum kata BERSAMBUNG
+         let cutIndex = bersambungIndex;
+         while (cutIndex > 0 && (cleaned[cutIndex - 1] === '*' || cleaned[cutIndex - 1] === '_' || cleaned[cutIndex - 1] === ' ' || cleaned[cutIndex - 1] === '\n')) {
+             cutIndex--;
+         }
+         cleaned = cleaned.substring(0, cutIndex);
+    }
+
+    // 5. Bersihkan baris kosong berlebih yang mungkin tertinggal
+    cleaned = cleaned.replace(/\n{3,}/g, '\n\n'); 
+
+    return cleaned.trim();
+};
+
+// --- Themes ---
+const themes = {
+    'blue-dark': { 
+        name: 'Midnight Blue', 
+        colors: { 
+            '--bg-primary': '#0f172a', 
+            '--bg-secondary': '#1e293b', 
+            '--bg-tertiary': '#334155', 
+            '--text-primary': '#f8fafc', 
+            '--text-secondary': '#94a3b8', 
+            '--accent-primary': '#38bdf8', 
+            '--accent-secondary': '#818cf8', 
+            '--danger': '#ef4444' 
+        } 
+    },
+    'forest-dark': { 
+        name: 'Forest Mystery', 
+        colors: { 
+            '--bg-primary': '#052e16', 
+            '--bg-secondary': '#14532d', 
+            '--bg-tertiary': '#166534', 
+            '--text-primary': '#f0fdf4', 
+            '--text-secondary': '#86efac', 
+            '--accent-primary': '#4ade80', 
+            '--accent-secondary': '#22c55e', 
+            '--danger': '#ef4444' 
+        } 
+    },
+    'coffee-paper': { 
+        name: 'Old Paper', 
+        colors: { 
+            '--bg-primary': '#f5f5dc', 
+            '--bg-secondary': '#e8e4c9', 
+            '--bg-tertiary': '#d4d0b0', 
+            '--text-primary': '#3e2723', 
+            '--text-secondary': '#5d4037', 
+            '--accent-primary': '#795548', 
+            '--accent-secondary': '#8d6e63', 
+            '--danger': '#d32f2f' 
+        } 
+    },
+};
+
+const DEFAULT_AUTHORS = ['SUYATNO ABU BAKAR', 'SATRIA 7', 'Putra Langit'];
+
+// --- Instruksi EYD & Dialog Global (DIPERKETAT + SOLUSI JSON ESCAPE) ---
+const EYD_INSTRUCTION = `ATURAN MUTLAK TANDA BACA & DIALOG (PENTING! BACA INI SEBELUM MENULIS): 
+1. WAJIB MENGGUNAKAN TANDA PETIK GANDA ("...") pada setiap kalimat dialog/percakapan tokoh. Tidak boleh terlewat atau menjadi narasi biasa!
+2. TRIK JSON (SANGAT PENTING): Agar format JSON tidak rusak, Anda WAJIB menambahkan backslash sebelum tanda petik pada dialog (\\").
+   - CONTOH JSON YANG BENAR: "content": "Prabu Sakil menoleh.\\n\\n\\"Turunkan layar utama sekarang!\\" perintahnya tegas."
+   - CONTOH JSON SALAH (JANGAN MENGHILANGKAN PETIK): "content": "Prabu Sakil menoleh. Turunkan layar utama sekarang! perintahnya tegas."
+3. PARAGRAF DIALOG (\\n\\n): Setiap kali tokoh baru berbicara, wajib buat baris baru menggunakan \\n\\n.
+4. Jangan menggunakan format naskah drama (Nama: "Dialog"). Gunakan narasi menyatu layaknya novel profesional.
+5. Tanda baca titik/koma/seru pada akhir dialog selalu di dalam tanda petik.`;
+
+function App() {
+    // --- State Management ---
+    const [userId, setUserId] = useState(null);
+    const [novels, setNovels] = useState([]);
+    const [currentNovel, setCurrentNovel] = useState(null);
+    const [currentEpisodeContent, setCurrentEpisodeContent] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [message, setMessage] = useState('');
+    const [view, setView] = useState('novelList'); 
+    
+    // Editor States
+    const [selectedEpisodeNumber, setSelectedEpisodeNumber] = useState(1);
+    const [editingEpisodeId, setEditingEpisodeId] = useState(null);
+    const [editedEpisodeContent, setEditedEpisodeContent] = useState('');
+    const [editedEpisodeTitle, setEditedEpisodeTitle] = useState(''); 
+
+    // Reader Mode State
+    const [readingEpisodeIndex, setReadingEpisodeIndex] = useState(0); 
+
+    // Title Editing State 
+    const [isEditingTitle, setIsEditingTitle] = useState(false);
+    const [tempTitle, setTempTitle] = useState('');
+
+    // Synopsis Generator State
+    const [showSynopsisModal, setShowSynopsisModal] = useState(false);
+    const [generatedSynopsis, setGeneratedSynopsis] = useState('');
+    const [isGeneratingSynopsis, setIsGeneratingSynopsis] = useState(false);
+
+    // Title Generator State
+    const [showTitleModal, setShowTitleModal] = useState(false);
+    const [generatedTitles, setGeneratedTitles] = useState([]);
+    const [isGeneratingTitles, setIsGeneratingTitles] = useState(false);
+
+    // Cover Image State
+    const [coverImages, setCoverImages] = useState({}); 
+    const [isGeneratingCoverPrompt, setIsGeneratingCoverPrompt] = useState(false); 
+
+    // Novel Settings State
+    const [showNovelSettings, setShowNovelSettings] = useState(false);
+    const [settingFootnote, setSettingFootnote] = useState(''); // NEW: Footnote state for Settings
+
+    // Print & Book Editor State
+    const [bookPrintData, setBookPrintData] = useState(null);
+
+    // Find & Replace States
+    const [showFindTool, setShowFindTool] = useState(false);
+    const [findKeyword, setFindKeyword] = useState('');
+    const [foundMatches, setFoundMatches] = useState([]); 
+    const [aiWordSuggestions, setAiWordSuggestions] = useState({}); 
+    const [manualReplaceInput, setManualReplaceInput] = useState({}); 
+
+    // Author Management State
+    const [customAuthors, setCustomAuthors] = useState(DEFAULT_AUTHORS);
+    const [newAuthorInput, setNewAuthorInput] = useState('');
+    const [editingAuthorIndex, setEditingAuthorIndex] = useState(null);
+    const [editAuthorInput, setEditAuthorInput] = useState('');
+
+    // Creation Form States
+    const [newNovelTitle, setNewNovelTitle] = useState('');
+    const [newNovelOpeningPlot, setNewNovelOpeningPlot] = useState('');
+    const [newNovelMainCharacters, setNewNovelMainCharacters] = useState('');
+    const [newNovelGenre, setNewNovelGenre] = useState('');
+    const [newNovelTone, setNewNovelTone] = useState('');
+    const [authorNameSelection, setAuthorNameSelection] = useState(DEFAULT_AUTHORS[0]);
+    const [newNovelEstimatedEpisodes, setNewNovelEstimatedEpisodes] = useState('10');
+    const [writingStyle, setWritingStyle] = useState('Gaya Platform Online (Umum)');
+    const [customFootnote, setCustomFootnote] = useState(''); // NEW: Footnote state for Creation
+    
+    // Generator States
+    const [nextEpisodePlotOutline, setNextEpisodePlotOutline] = useState('');
+    const [charactersForNextEpisode, setCharactersForNextEpisode] = useState('');
+    const [searchTitle, setSearchTitle] = useState('');
+    const [storyType, setStoryType] = useState('');
+    const [fullPlot, setFullPlot] = useState('');
+    const [suggestedTitles, setSuggestedTitles] = useState([]);
+    const [generatorView, setGeneratorView] = useState('search');
+    const [numEpisodesToGenerate, setNumEpisodesToGenerate] = useState(10);
+    const [targetWordCount, setTargetWordCount] = useState('1000-1500'); 
+    const [epicVersion, setEpicVersion] = useState(''); 
+    
+    // Adaptation States
+    const [adaptLocation, setAdaptLocation] = useState('');
+    const [adaptEra, setAdaptEra] = useState('');
+    const [availableEras, setAvailableEras] = useState([]);
+
+    // Prompt Modal States
+    const [showPosterPromptModal, setShowPosterPromptModal] = useState(false);
+    const [activePosterPrompt, setActivePosterPrompt] = useState('');
+
+    // Settings States
+    const [showSettings, setShowSettings] = useState(false);
+    const [apiKey, setApiKey] = useState('');
+    const [wordFilter, setWordFilter] = useState('');
+    const [appTheme, setAppTheme] = useState('blue-dark');
+    const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+    const [showEpisodeDeleteConfirm, setShowEpisodeDeleteConfirm] = useState(false); 
+    const [showRegenerateConfirm, setShowRegenerateConfirm] = useState(false); 
+    const [copySuccess, setCopySuccess] = useState('');
+    const [printSettings, setPrintSettings] = useState({ fontSize: '11pt', lineHeight: '1.8', formatTarget: 'playbooks' }); // UPDATED: Print Settings formatTarget
+
+    // Flags
+    const [isGeneratingPlot, setIsGeneratingPlot] = useState(false);
+    const [isGeneratingPosterPrompt, setIsGeneratingPosterPrompt] = useState(false);
+    const [isSearchingWords, setIsSearchingWords] = useState(false);
+
+
+    // --- Constants ---
+    const wordCountOptions = [
+        { label: 'Pendek (500-1000 kata)', value: '500-1000' },
+        { label: 'Standar (1000-1500 kata)', value: '1000-1500' },
+        { label: 'Panjang (1500-2000 kata)', value: '1500-2000' },
+        { label: 'Ekstra Panjang (2000+ kata)', value: '2000-2500' }
+    ];
+
+    const writingStyleOptions = [
+        'Bahasa Sehari-hari (Sederhana & Mengalir)',
+        'Sastra Puitis (Indah & Deskriptif)',
+        'Cepat & Penuh Aksi (To the Point)',
+        'Misterius & Gelap (Noir)',
+        'Humoris & Ringan (Jenaka)',
+        'Formal & Klasik (Baku)',
+        'Melodrama (Emosional)'
+    ];
+
+    const storyTypeOptions = [
+        'Biografi Tokoh', 
+        'Cerita Rakyat', 'Dongeng', 'Sejarah', 'Mitos', 'Legenda', 'Fabel', 'Epik', 'Romansa Modern', 'Sci-Fi', 'Epos Mahabaratha', 'Ramayana'
+    ];
+    
+    const epicVersionsOptions = {
+        'Epos Mahabaratha': [
+            'Versi Asli India (Vyasa) - Klasik & Filosofis',
+            'Pewayangan Jawa (Purwa) - Mistis & Budaya Lokal',
+            'Kakawin Bharatayuddha - Jawa Kuno',
+            'Pewayangan Sunda (Golek)',
+            'Adaptasi Modern (Pop Culture)'
+        ],
+        'Ramayana': [
+            'Versi Asli India (Valmiki) - Klasik',
+            'Pewayangan Jawa - Nuansa Lokal',
+            'Kakawin Ramayana - Jawa Kuno',
+            'Ramakien - Gaya Thailand',
+            'Adaptasi Modern'
+        ]
+    };
+
+    const genreOptions = [
+        { name: 'Pewayangan Jawa', description: 'Kisah klasik wayang kulit/orang dengan filosofi Jawa kental.' },
+        { name: 'Biografi / Kisah Tokoh', description: 'Perjalanan hidup tokoh sejarah/wayang dari lahir hingga wafat.' },
+        { name: 'Epos Mahabaratha', description: 'Kisah perang besar Kurukshetra antara Pandawa dan Kurawa.' },
+        { name: 'Ramayana', description: 'Perjalanan Rama menyelamatkan Shinta.' },
+        { name: 'Kolosal / Sejarah', description: 'Perang besar, intrik kerajaan, dan latar sejarah.' },
+        { name: 'Mitologi & Dewa', description: 'Melibatkan dewa-dewi, kayangan, dan kekuatan sakti.' },
+        { name: 'Konflik Etika', description: 'Cerita yang berpusat pada dilema moral dan etika.' },
+        { name: 'Nikah Paksa', description: 'Kisah tentang pernikahan tanpa persetujuan.' },
+        { name: 'Anak Rahasia', description: 'Pengungkapan anak yang dirahasiakan.' },
+        { name: 'Air Mata Pernikahan', description: 'Drama suka duka pernikahan.' },
+        { name: 'Cinta Romantis', description: 'Hubungan cinta dan emosional.' },
+        { name: 'Fantasi Wanita', description: 'Fantasi dengan protagonis wanita.' },
+        { name: 'Fiksi Remaja', description: 'Tema relevan untuk remaja.' },
+        { name: 'Pembalasan Wanita', description: 'Protagonis wanita membalas dendam.' },
+        { name: 'Fantasi Pria', description: 'Fantasi dengan protagonis pria.' },
+        { name: 'Urban Pria', description: 'Latar perkotaan modern, protagonis pria.' },
+        { name: 'Horror/Misteri', description: 'Menimbulkan takut dan teka-teki.' }
+    ];
+    
+    const toneOptions = [
+        { name: 'Dramatis', description: 'Konflik emosional intens.' },
+        { name: 'Romantis', description: 'Fokus pada cinta.' },
+        { name: 'Tegang', description: 'Ketegangan dan antisipasi.' },
+        { name: 'Menyayat Hati', description: 'Sedih, tragis.' },
+        { name: 'Misterius', description: 'Penuh teka-teki.' },
+        { name: 'Lucu/Ringan', description: 'Humor, menghibur.' },
+        { name: 'Epik/Agung', description: 'Skala cerita luas, kepahlawanan.' },
+        { name: 'Sinis/Sarkastik', description: 'Ironi dan sindiran.' },
+        { name: 'Inspiratif', description: 'Semangat dan harapan.' },
+        { name: 'Melankolis', description: 'Sedih, perenungan.' }
+    ];
+    const indonesianLocationsAndEras = [
+        { region: "Jawa", eras: ["Era Kerajaan Tarumanegara (Abad 4-7)", "Era Majapahit (Abad 13-15)", "Era Kolonial", "Jawa Cyberpunk 2077"] },
+        { region: "Sumatra", eras: ["Era Sriwijaya (Abad 7-13)", "Era Kesultanan Aceh", "Sumatra Ecopunk 2100"] },
+        { region: "Kalimantan", eras: ["Era Kutai Martadipura", "Kalimantan Solarpunk"] },
+        { region: "Sulawesi", eras: ["Era Gowa-Tallo", "Sulawesi Bawah Laut"] },
+        { region: "Bali & Nusa Tenggara", eras: ["Era Bali Kuno", "Pariwisata Modern", "Futuristik Energi"] },
+        { region: "Maluku & Papua", eras: ["Era Rempah", "Papua Space Station"] }
+    ];
+
+    // --- Effects ---
+
+    useEffect(() => {
+        const theme = themes[appTheme] || themes['blue-dark'];
+        Object.entries(theme.colors).forEach(([key, value]) => {
+            document.documentElement.style.setProperty(key, value);
+        });
+    }, [appTheme]);
+
+    useEffect(() => {
+        if (!auth) return;
+        const unsubscribe = onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+            } else {
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    console.error("Auth error:", error);
+                    setMessage("Gagal autentikasi layanan.");
+                }
+            }
+        });
+        return () => unsubscribe();
+    }, []);
+
+    useEffect(() => {
+        if (!userId || !db) return;
+        const settingsRef = doc(db, `artifacts/${appId}/users/${userId}/settings`, "appSettings");
+        const unsubscribe = onSnapshot(settingsRef, (doc) => {
+            if (doc.exists()) {
+                const data = doc.data();
+                setApiKey(data.apiKey || '');
+                setWordFilter(data.wordFilter || '');
+                setAppTheme(data.appTheme || 'blue-dark');
+                
+                // Load Custom Authors
+                if (data.customAuthors && Array.isArray(data.customAuthors)) {
+                    setCustomAuthors(data.customAuthors);
+                    if (data.customAuthors.length > 0 && !data.customAuthors.includes(authorNameSelection)) {
+                        setAuthorNameSelection(data.customAuthors[0]);
+                    }
+                }
+            }
+        });
+        return () => unsubscribe();
+    }, [userId]);
+
+    useEffect(() => {
+        if (!userId || !db) return;
+        const novelsRef = collection(db, `artifacts/${appId}/users/${userId}/novels`);
+        const q = query(novelsRef, orderBy("createdAt", "desc"));
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const fetchedNovels = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setNovels(fetchedNovels);
+        });
+        return () => unsubscribe();
+    }, [userId]);
+
+    useEffect(() => {
+        if (!currentNovel?.id || !userId || !db) return;
+        const episodesRef = collection(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id, 'episodes');
+        const q = query(episodesRef);
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const fetchedEpisodes = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            fetchedEpisodes.sort((a, b) => a.episodeNumber - b.episodeNumber);
+            
+            setCurrentNovel(prev => ({ ...prev, episodes: fetchedEpisodes }));
+            
+            if (!editingEpisodeId) {
+                const ep = fetchedEpisodes.find(e => e.episodeNumber === selectedEpisodeNumber);
+                if (ep) {
+                    setCurrentEpisodeContent(ep.content);
+                } else if (fetchedEpisodes.length > 0) {
+                     setCurrentEpisodeContent(fetchedEpisodes[0].content);
+                     setSelectedEpisodeNumber(fetchedEpisodes[0].episodeNumber);
+                } else {
+                    setCurrentEpisodeContent('');
+                }
+            }
+        });
+        return () => unsubscribe();
+    }, [currentNovel?.id, userId, editingEpisodeId, selectedEpisodeNumber]);
+
+    useEffect(() => {
+        if (!currentNovel?.episodes?.length) return;
+        const lastWritten = currentNovel.episodes.filter(e => e.content).pop();
+        if (!lastWritten) {
+            const ep1 = currentNovel.episodes.find(e => e.episodeNumber === 1);
+            if (ep1) {
+                setNextEpisodePlotOutline(ep1.plotOutline || '');
+                setCharactersForNextEpisode(ep1.charactersInvolved ? ep1.charactersInvolved.join(', ') : '');
+            }
+            return;
+        }
+        if (selectedEpisodeNumber === lastWritten.episodeNumber) {
+            const nextEp = currentNovel.episodes.find(e => e.episodeNumber === lastWritten.episodeNumber + 1);
+            if (nextEp && !nextEp.content) {
+                setNextEpisodePlotOutline(nextEp.plotOutline || '');
+                setCharactersForNextEpisode(nextEp.charactersInvolved ? nextEp.charactersInvolved.join(', ') : '');
+            } else {
+                setNextEpisodePlotOutline('');
+                setCharactersForNextEpisode('');
+            }
+        }
+    }, [selectedEpisodeNumber, currentNovel]);
+
+    // --- API Logic ---
+    const callGeminiAPI = useCallback(async (prompt, setLoadingState = setLoading, jsonMode = false) => {
+        setLoadingState(true);
+        setMessage(''); 
+        try {
+            const userApiKey = apiKey || ""; 
+            const payload = { 
+                contents: [{ role: "user", parts: [{ text: prompt }] }],
+                ...(jsonMode && { 
+                    generationConfig: { responseMimeType: "application/json" } 
+                })
+            };
+            
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${userApiKey}`;
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const err = await response.text();
+                throw new Error(`API Error: ${response.status} - ${err}`);
+            }
+
+            const result = await response.json();
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) throw new Error("No text returned from AI");
+            return text;
+        } catch (error) {
+            console.error("Gemini Error:", error);
+            setMessage(`Gagal: ${error.message}`);
+            throw error;
+        } finally {
+            setLoadingState(false);
+        }
+    }, [apiKey]);
+
+    // --- NEW: TITLE GENERATOR LOGIC ---
+    const handleGenerateTitleSuggestions = async () => {
+        if (!currentNovel) return;
+        setIsGeneratingTitles(true);
+        setMessage("Mencari ide judul episode...");
+        
+        try {
+            const currentEp = currentNovel.episodes?.find(e => e.episodeNumber === selectedEpisodeNumber);
+            const contentContext = currentEp?.content ? currentEp.content.slice(0, 1000) : (currentEp?.plotOutline || "Belum ada konten.");
+            
+            const prompt = `Buatkan 10 ide judul episode yang menarik, puitis, dan bikin penasaran untuk Novel: "${currentNovel.title}". 
+            Genre: ${currentNovel.genre}. 
+            Konteks Episode: ${contentContext}.
+            
+            Instruksi: Judul harus singkat (3-7 kata) dan estetik.
+            Format Output: HANYA JSON Array berisi string. Contoh: ["Judul 1", "Judul 2"]. Jangan ada key object.`;
+
+            const res = await callGeminiAPI(prompt, setIsGeneratingTitles, true);
+            const titles = parseAIResponse(res);
+            
+            if (Array.isArray(titles)) {
+                setGeneratedTitles(titles);
+                setShowTitleModal(true);
+                setMessage("Ide judul siap!");
+            } else {
+                if (titles.titles && Array.isArray(titles.titles)) {
+                    setGeneratedTitles(titles.titles);
+                    setShowTitleModal(true);
+                    setMessage("Ide judul siap!");
+                } else {
+                    throw new Error("Format respon AI tidak dikenali.");
+                }
+            }
+        } catch (e) {
+            setMessage("Gagal membuat judul: " + e.message);
+        } finally {
+            setIsGeneratingTitles(false);
+        }
+    };
+
+    // --- NEW: COVER PROMPT GENERATOR LOGIC ---
+    const handleGenerateCoverPrompt = async () => {
+        if (!currentNovel) return;
+        
+        setIsGeneratingCoverPrompt(true);
+        setMessage("Merancang prompt untuk sampul...");
+        
+        try {
+            const genrePrompt = (currentNovel.genre === 'Umum' || !currentNovel.genre) ? 'Fantasy/Drama' : currentNovel.genre;
+            
+            const safePlot = (currentNovel.openingPlot || "A mysterious story")
+                .replace(/[\u0000-\u001F\u007F-\u009F]/g, "") 
+                .slice(0, 800)
+                .replace(/\n/g, ' ');
+
+            const prompt = `Peran: Prompt Engineer untuk AI Art (Spesialis Typography & Layout).
+            Tugas: Buatlah prompt lengkap dalam Bahasa Inggris yang sangat detail untuk men-generate Cover Novel yang mengandung teks.
+            
+            Data Novel:
+            - Judul: "${currentNovel.title}"
+            - Penulis: "${currentNovel.authorName}"
+            - Genre: ${genrePrompt}
+            - Konteks Cerita: ${safePlot}
+            
+            Instruksi Prompt:
+            1. VISUAL: Deskripsikan ilustrasi sampul yang sangat detail, cinematic, dan sesuai genre (High Quality, 8k).
+            2. TEXT LAYOUT: Instruksikan agar gambar memuat teks Judul "${currentNovel.title}" di bagian atas/tengah dengan font yang elegan dan besar.
+            3. AUTHOR: Instruksikan agar nama penulis "${currentNovel.authorName}" ditulis dengan font SANGAT KECIL (very small font), posisinya DI TENGAH (centered), dan TEPAT DI BAWAH JUDUL (exactly below the title).
+            4. CLEAN DESIGN: Jangan tambahkan teks lain selain Judul dan Nama Penulis. Tidak boleh ada blurb, sinopsis, atau tagline.
+            
+            Output:
+            Hanya berikan teks prompt final dalam Bahasa Inggris.`;
+
+            const text = await callGeminiAPI(prompt, setIsGeneratingCoverPrompt);
+            
+            setActivePosterPrompt(text);
+            setShowPosterPromptModal(true);
+            setMessage("Prompt dengan judul & penulis siap! Silakan salin.");
+        } catch (e) {
+            setMessage("Gagal membuat prompt: " + e.message);
+        } finally {
+            setIsGeneratingCoverPrompt(false);
+        }
+    };
+
+    const handleUploadCover = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        
+        if (file.size > 5 * 1024 * 1024) {
+            setMessage("Ukuran file terlalu besar. Maksimal 5MB.");
+            return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            setCoverImages(prev => ({ ...prev, [currentNovel.id]: event.target.result }));
+            setMessage("Sampul berhasil diunggah! (Tersimpan di browser)");
+        };
+        reader.readAsDataURL(file);
+    };
+
+    // --- Feature Handlers (Import, Download, etc.) ---
+    
+    const handleUploadPlot = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        if (file.size > 2 * 1024 * 1024) { 
+             setMessage("File terlalu besar (Maks 2MB).");
+             return;
+        }
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            setFullPlot(event.target.result);
+            setMessage("Alur cerita berhasil dimuat dari file!");
+        };
+        reader.readAsText(file);
+    };
+
+    const handleUploadNextEpisodePlot = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        if (file.size > 2 * 1024 * 1024) { 
+             setMessage("File terlalu besar (Maks 2MB).");
+             return;
+        }
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            setNextEpisodePlotOutline(event.target.result);
+            setMessage("Ringkasan alur berhasil dimuat dari file!");
+        };
+        reader.readAsText(file);
+    };
+
+    const handleFileImport = async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+        if (!userId || !db) return setMessage("Koneksi database belum siap.");
+        setLoading(true);
+        setMessage("Membaca dan memproses file novel...");
+        
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            try {
+                const text = e.target.result;
+                const parts = text.split(/===\s*EPISODE/i);
+                const headerText = parts[0]; 
+                parts.shift(); 
+                const titleMatch = headerText.match(/^Judul:\s*(.*)/im);
+                const authorMatch = headerText.match(/^Penulis:\s*(.*)/im);
+                const genreMatch = headerText.match(/^Genre:\s*(.*)/im);
+                const extractedTitle = titleMatch ? titleMatch[1].trim() : file.name.replace('.txt', '');
+                const extractedAuthor = authorMatch ? authorMatch[1].trim() : (customAuthors[0] || 'Penulis Impor');
+                const extractedGenre = genreMatch ? genreMatch[1].trim() : 'Umum';
+
+                let extractedSynopsis = "";
+                const synopsisTagMatch = headerText.match(/^(?:Sinopsis|Plot|Deskripsi|Ringkasan):\s*([\s\S]*?)(?=\n\n|\n===|$)/im);
+                
+                if (synopsisTagMatch) {
+                    extractedSynopsis = synopsisTagMatch[1].trim();
+                } else {
+                    let sourceText = headerText.replace(/^Judul:.*$/igm, '').replace(/^Penulis:.*$/igm, '').replace(/^Genre:.*$/igm, '').trim();
+                    if (sourceText.length < 50 && parts.length > 0) {
+                        const firstEpRaw = parts[0];
+                        const firstEpLines = firstEpRaw.trim().split('\n');
+                        if (firstEpLines.length > 0 && firstEpLines[0].match(/^\s*(\d+|:)/)) { firstEpLines.shift(); }
+                        sourceText = firstEpLines.join(' ');
+                    } else if (sourceText.length < 50 && parts.length === 0) {
+                        sourceText = text.replace(/^Judul:.*$/igm, '').replace(/^Penulis:.*$/igm, '').replace(/^Genre:.*$/igm, '').trim();
+                    }
+                    if (sourceText.length > 0) {
+                        const words = sourceText.split(/\s+/).filter(w => w.length > 0);
+                        const wordLimit = 120;
+                        const snippet = words.slice(0, wordLimit).join(' ');
+                        extractedSynopsis = snippet + (words.length > wordLimit ? "..." : "");
+                    }
+                }
+                if (!extractedSynopsis || extractedSynopsis.length < 10) { extractedSynopsis = "Sinopsis belum tersedia."; }
+
+                const novelData = { title: extractedTitle, authorName: extractedAuthor, genre: extractedGenre, openingPlot: extractedSynopsis, createdAt: new Date().toISOString() };
+                const novelRef = await addDoc(collection(db, `artifacts/${appId}/users/${userId}/novels`), novelData);
+                const batch = writeBatch(db);
+                const epCol = collection(db, `artifacts/${appId}/users/${userId}/novels`, novelRef.id, 'episodes');
+
+                if (parts.length === 0) {
+                     const contentBody = text.replace(/^Judul:.*$/igm, '').replace(/^Penulis:.*$/igm, '').replace(/^Genre:.*$/igm, '').replace(/^(?:Sinopsis|Plot|Deskripsi):[\s\S]*?(?=\n\n)/im, '').trim();
+                     const epRef = doc(epCol);
+                     batch.set(epRef, { episodeNumber: 1, title: "Full Text", content: contentBody.substring(0, 50000), generatedAt: new Date().toISOString() });
+                } else {
+                    parts.forEach((part, index) => {
+                        const lines = part.trim().split('\n');
+                        const markerLine = lines.shift(); 
+                        const content = lines.join('\n').trim();
+                        let epNum = index + 1;
+                        let epTitle = `Episode ${epNum}`;
+                        const headerMatch = markerLine ? markerLine.match(/^\s*(\d+)[\s:-]*(.*?)===/) : null;
+                        if (headerMatch) { epNum = parseInt(headerMatch[1]) || index + 1; epTitle = headerMatch[2].trim() || epTitle; }
+                        const epRef = doc(epCol);
+                        batch.set(epRef, { episodeNumber: epNum, title: epTitle, content: content, generatedAt: new Date().toISOString() });
+                    });
+                }
+                await batch.commit();
+                setMessage("Novel berhasil diimpor!");
+                handleSelectNovel({ ...novelData, id: novelRef.id });
+            } catch (err) { console.error(err); setMessage("Gagal impor: " + err.message); } finally { setLoading(false); }
+        };
+        reader.readAsText(file);
+    };
+
+    const triggerTextDownload = (fileContent, fileName) => {
+        // BOM membantu aplikasi teks mengenali karakter Bahasa Indonesia/Unicode dengan benar.
+        const blob = new Blob(["\uFEFF", fileContent], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        // Jangan revoke terlalu cepat agar browser sempat memulai unduhan.
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+
+    const getSafeNovelFileName = (title) => (title || 'novel')
+        .normalize('NFKD')
+        .replace(/[^a-z0-9]+/gi, '_')
+        .replace(/^_+|_+$/g, '')
+        .toLowerCase() || 'novel';
+
+    const handleDownloadNovel = () => {
+        if (!currentNovel) return;
+        const episodes = [...(currentNovel.episodes || [])]
+            .sort((a, b) => (a.episodeNumber || 0) - (b.episodeNumber || 0));
+        if (episodes.length === 0) {
+            setMessage('Novel ini belum memiliki episode untuk diunduh.');
+            return;
+        }
+
+        const fileContent = [
+            `Judul Novel: ${currentNovel.title || 'Tanpa Judul'}`,
+            `Penulis: ${currentNovel.authorName || 'Tidak diketahui'}`,
+            `Genre: ${currentNovel.genre || 'Umum'}`,
+            currentNovel.openingPlot ? `Sinopsis:\n${currentNovel.openingPlot}` : '',
+            '',
+            ...episodes.flatMap(ep => [
+                `=== EPISODE ${ep.episodeNumber || ''}: ${ep.title || `Episode ${ep.episodeNumber || ''}`} ===`,
+                '',
+                (ep.content || '').trim() || '(Episode ini belum ditulis)',
+                '',
+                ''
+            ])
+        ].filter((line, index, arr) => !(line === '' && arr[index - 1] === '' && arr[index + 1] === ''))
+         .join('\n').trim() + '\n';
+
+        triggerTextDownload(fileContent, `${getSafeNovelFileName(currentNovel.title)}.txt`);
+        setMessage(`Novel berhasil diunduh dalam format TXT (${episodes.length} episode).`);
+    };
+
+    const handleDownloadCurrentEpisode = () => {
+        if (!currentNovel || !currentNovel.episodes) return;
+        const currentEp = currentNovel.episodes.find(e => e.episodeNumber === selectedEpisodeNumber);
+        if (!currentEp) {
+            setMessage('Episode tidak ditemukan atau belum dipilih.');
+            return;
+        }
+        const fileContent = `Judul Novel: ${currentNovel.title || 'Tanpa Judul'}\nPenulis: ${currentNovel.authorName || 'Tidak diketahui'}\n\n=== EPISODE ${currentEp.episodeNumber}: ${currentEp.title || ''} ===\n\n${currentEp.content || '(Episode ini belum ditulis)'}\n`;
+        triggerTextDownload(fileContent, `${getSafeNovelFileName(currentNovel.title)}_Episode_${currentEp.episodeNumber}.txt`);
+        setMessage(`Episode ${currentEp.episodeNumber} berhasil diunduh.`);
+    };
+    
+    const handlePreparePrint = () => {
+        if (!currentNovel) return;
+        const sortedEpisodes = [...(currentNovel.episodes || [])].sort((a, b) => a.episodeNumber - b.episodeNumber);
+        
+        setBookPrintData({
+            title: currentNovel.title || 'Judul Belum Ada',
+            author: currentNovel.authorName || 'Penulis Tidak Diketahui',
+            synopsis: currentNovel.openingPlot || '',
+            publisher: 'Penerbit Mandiri (Independen)',
+            isbn: '',
+            publishYear: new Date().getFullYear().toString(),
+            episodes: sortedEpisodes.map(ep => ({
+                id: ep.id,
+                title: ep.title,
+                content: cleanContentForPrint(ep.content || '', currentNovel.footnote, ep.title),
+                episodeNumber: ep.episodeNumber
+            }))
+        });
+        
+        setView('bookEditor');
+    };
+
+    const handleSaveBookEdits = async () => {
+        if (!bookPrintData || !currentNovel) return;
+        setLoading(true);
+        setMessage("Menyimpan perubahan buku...");
+        
+        try {
+            // Update title and synopsis in main document
+            const novelRef = doc(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id);
+            await updateDoc(novelRef, { 
+                title: bookPrintData.title, 
+                openingPlot: bookPrintData.synopsis 
+            });
+
+            // Batch update all episodes
+            const batch = writeBatch(db);
+            bookPrintData.episodes.forEach(ep => {
+                const epRef = doc(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id, 'episodes', ep.id);
+                batch.update(epRef, { title: ep.title, content: ep.content });
+            });
+            await batch.commit();
+
+            // Update local state to reflect changes immediately
+            setCurrentNovel(prev => ({
+                ...prev,
+                title: bookPrintData.title,
+                openingPlot: bookPrintData.synopsis,
+                episodes: prev.episodes.map(oldEp => {
+                    const editedEp = bookPrintData.episodes.find(e => e.id === oldEp.id);
+                    return editedEp ? { ...oldEp, title: editedEp.title, content: editedEp.content } : oldEp;
+                })
+            }));
+            
+            setMessage("Perubahan berhasil disimpan permanen!");
+        } catch (error) {
+            setMessage("Gagal menyimpan: " + error.message);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleExecutePrint = () => {
+        if (!bookPrintData) return;
+        const coverImageSrc = coverImages[currentNovel?.id];
+
+        // Hitung estimasi karakter per halaman berdasarkan pengaturan
+        let charsPerPage = 1100;
+        if (printSettings.fontSize === '10pt') charsPerPage = 1400;
+        if (printSettings.fontSize === '12pt') charsPerPage = 900;
+        if (printSettings.lineHeight === '2.0') charsPerPage *= 0.9;
+        if (printSettings.lineHeight === '1.5') charsPerPage *= 1.1;
+
+        // --- Table of Contents & Page Estimation ---
+        let currentPage = 6; // Cover(1), Blank(2), Title(3), Copyright(4), Synopsis(5) -> Starts Chapter 1 around Page 6
+        let tocHTML = `<div class="print-page toc-page"><h2 class="toc-title">Daftar Isi</h2><div class="toc-container">`;
+
+        bookPrintData.episodes.forEach(ep => {
+            if (ep.content && ep.content.length > 50) {
+                // Bersihkan "Episode X" dari judul agar tidak dobel
+                let displayTitle = ep.title;
+                const titleRegex = new RegExp(`^Episode\\s*${ep.episodeNumber}[:\\-\\s]*`, 'i');
+                displayTitle = displayTitle.replace(titleRegex, '').trim();
+
+                if (printSettings.formatTarget === 'playbooks') {
+                    // Google Play Books format (Digital) - No page numbers needed, clean semantic links
+                    tocHTML += `
+                        <div class="toc-item" style="justify-content: flex-start; margin-bottom: 16px;">
+                            <a href="#episode-${ep.episodeNumber}" style="text-decoration: none; color: #000; font-weight: bold; font-size: 14pt;">
+                                Episode ${ep.episodeNumber}: ${displayTitle}
+                            </a>
+                        </div>
+                    `;
+                } else {
+                    // Buku Fisik Format
+                    tocHTML += `
+                        <div class="toc-item">
+                            <span class="toc-chapter">Episode ${ep.episodeNumber}: ${displayTitle}</span>
+                            <span class="toc-dots"></span>
+                            <span class="toc-page-num">${currentPage}</span>
+                        </div>
+                    `;
+                }
+                // Calculate estimated pages for this chapter
+                const estimatedPagesForChapter = Math.max(1, Math.ceil(ep.content.length / charsPerPage));
+                currentPage += estimatedPagesForChapter;
+            }
+        });
+        tocHTML += `</div></div>`;
+
+        // --- Helper for Content Formatting (Paragraphs & Drop Cap) ---
+        const formatContent = (text) => {
+            return text.split(/\n\n+/).map(para => `<p>${para}</p>`).join('');
+        };
+
+        // --- HTML Construction ---
+        let contentHTML = `
+            <!DOCTYPE html>
+            <html lang="id">
+            <head>
+                <meta charset="utf-8">
+                <title>${bookPrintData.title}</title>
+                <meta name="author" content="${bookPrintData.author}">
+                <style>
+                    /* Print specific rules for standard Book A5 */
+                    @page { 
+                        size: 148mm 210mm; 
+                        margin: ${printSettings.formatTarget === 'playbooks' ? '12mm' : '18mm'}; 
+                    } 
+                    @media print {
+                        body { background: white; margin: 0; padding: 0; }
+                        .page-wrapper { box-shadow: none; margin: 0; padding: 0; width: auto; height: auto; border: none; }
+                        .no-print { display: none !important; }
+                        /* Paksa pemisahan halaman untuk setiap blok .print-page */
+                        .print-page { page-break-after: always !important; break-after: page !important; }
+                        
+                        /* Play Books link rendering */
+                        a { text-decoration: none; color: black; }
+                    }
+                    
+                    /* Visual Web Preview Styling */
+                    body { font-family: 'Georgia', 'Times New Roman', serif; color: #000; background: #525659; margin: 0; padding: 20px; }
+                    .page-wrapper { background: white; margin: 0 auto; box-shadow: 0 0 10px rgba(0,0,0,0.5); width: 100%; box-sizing: border-box; max-width: 210mm; }
+                    
+                    .print-page {
+                        page-break-after: always;
+                        break-after: page;
+                        display: block;
+                        width: 100%;
+                        box-sizing: border-box;
+                    }
+                    
+                    /* Sections */
+                    .cover-page { text-align: center; padding-top: 10%; }
+                    .full-cover-img { max-width: 100%; height: auto; max-height: 190mm; object-fit: contain; }
+                    
+                    .title-page { text-align: center; padding-top: 35%; }
+                    .title-page h1 { font-size: 28pt; line-height: 1.2; margin-bottom: 1cm; font-weight: bold; }
+                    .title-page .author { font-size: 16pt; color: #333; font-style: italic; }
+                    
+                    .copyright-page { padding-top: 30%; text-align: center; font-size: 10pt; line-height: 1.6; }
+                    
+                    .synopsis-page { padding: 15% 10% 0 10%; }
+                    .synopsis-page h2 { text-align: center; font-size: 18pt; border-bottom: 1px solid #ccc; padding-bottom: 10px; margin-bottom: 30px; text-transform: uppercase; letter-spacing: 2px;}
+                    .synopsis-page p { text-align: justify; font-size: ${printSettings.fontSize}; white-space: pre-wrap; text-indent: 2em; line-height: ${printSettings.lineHeight}; }
+                    
+                    /* Table of Contents */
+                    .toc-page { padding: 15% 10% 0 10%; }
+                    .toc-title { text-align: center; font-size: 20pt; font-weight: bold; margin-bottom: 1.5cm; border-bottom: 2px solid #000; padding-bottom: 10px; }
+                    .toc-container { width: 100%; }
+                    .toc-item { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 12px; font-size: 11pt; }
+                    .toc-chapter { background: white; padding-right: 5px; z-index: 1; font-weight: bold; }
+                    .toc-dots { flex-grow: 1; border-bottom: 2px dotted #999; margin: 0 5px; position: relative; top: -6px; z-index: 0; }
+                    .toc-page-num { background: white; padding-left: 5px; z-index: 1; font-weight: bold; }
+                    
+                    /* Content */
+                    .chapter-page { padding-top: 1px; }
+                    /* Use H2 for Play Books Semantic parsing */
+                    .chapter-title { text-align: center; margin-top: 2.5cm; margin-bottom: 1.5cm; font-weight: bold; font-size: 18pt; text-transform: uppercase; letter-spacing: 1px; }
+                    .content { text-align: justify; font-size: ${printSettings.fontSize}; line-height: ${printSettings.lineHeight}; padding: 0 5%; }
+                    .content p { text-indent: 2em; margin: 0 0 10px 0; }
+                    
+                    /* DROP CAP (Huruf pertama membesar) */
+                    .content p:first-of-type { text-indent: 0; }
+                    .content p:first-of-type::first-letter {
+                        font-size: 3.5em;
+                        float: left;
+                        line-height: 0.85;
+                        margin: 0.1em 0.1em 0 0;
+                        font-weight: bold;
+                        color: #222;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="page-wrapper">
+        `;
+
+        if (coverImageSrc) {
+            contentHTML += `<div class="print-page cover-page"><img src="${coverImageSrc}" class="full-cover-img" alt="Cover Novel" /></div>`;
+        }
+
+        contentHTML += `
+                <div class="print-page title-page">
+                    <h1>${bookPrintData.title}</h1>
+                    <div class="author">Karya: ${bookPrintData.author}</div>
+                </div>
+                <div class="print-page copyright-page">
+                    <p><strong>${bookPrintData.title}</strong></p>
+                    <p>Karya: ${bookPrintData.author}</p>
+                    <p>Penerbit: ${bookPrintData.publisher}</p>
+                    <p>Tahun Terbit: ${bookPrintData.publishYear}</p>
+                    ${bookPrintData.isbn ? `<p>ISBN: ${bookPrintData.isbn}</p>` : ''}
+                    <br/>
+                    <p>Hak Cipta © ${bookPrintData.publishYear} ${bookPrintData.author}</p>
+                    <p>Hak cipta dilindungi oleh undang-undang.<br/>Dilarang memperbanyak sebagian atau seluruh isi buku ini<br/>tanpa izin tertulis dari penulis.</p>
+                </div>
+        `;
+
+        if (bookPrintData.synopsis) {
+            contentHTML += `
+                <div class="print-page synopsis-page">
+                    <h2>Sinopsis</h2>
+                    <p>${bookPrintData.synopsis}</p>
+                </div>
+            `;
+        }
+
+        contentHTML += tocHTML;
+
+        bookPrintData.episodes.forEach(ep => {
+            if (ep.content && ep.content.length > 50) {
+                let displayTitle = ep.title;
+                const titleRegex = new RegExp(`^Episode\\s*${ep.episodeNumber}[:\\-\\s]*`, 'i');
+                displayTitle = displayTitle.replace(titleRegex, '').trim();
+
+                // Semantic H2 with ID added for Play Books TOC rendering
+                contentHTML += `
+                    <div class="print-page chapter-page" id="episode-${ep.episodeNumber}">
+                        <h2 class="chapter-title">Episode ${ep.episodeNumber}<br/>${displayTitle}</h2>
+                        <div class="content">${formatContent(ep.content)}</div>
+                    </div>
+                `;
+            }
+        });
+
+        contentHTML += `
+                </div>
+                <script>
+                    window.onload = function() { setTimeout(() => { window.print(); }, 500); };
+                </script>
+            </body>
+            </html>
+        `;
+
+        const printWindow = window.open('', '_blank');
+        if (printWindow) {
+            printWindow.document.write(contentHTML);
+            printWindow.document.close();
+        } else {
+            setMessage("Pop-up diblokir. Izinkan pop-up browser Anda untuk mencetak PDF.");
+        }
+    };
+
+    const handleDownloadEPUB = async () => {
+        if (!bookPrintData) return;
+        setLoading(true);
+        setMessage("Menyiapkan komponen EPUB...");
+
+        try {
+            // Load JSZip secara dinamis untuk mengemas EPUB
+            if (!window.JSZip) {
+                await new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+                    script.onload = resolve;
+                    script.onerror = reject;
+                    document.head.appendChild(script);
+                });
+            }
+
+            setMessage("Menyusun struktur buku digital...");
+            const zip = new window.JSZip();
+            
+            // 1. Mimetype wajib (tanpa ekstensi)
+            zip.file("mimetype", "application/epub+zip");
+            
+            // 2. Container
+            zip.folder("META-INF").file("container.xml", `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`);
+
+            const oebps = zip.folder("OEBPS");
+            const textFolder = oebps.folder("Text");
+            const stylesFolder = oebps.folder("Styles");
+            const imagesFolder = oebps.folder("Images");
+
+            // Utility membersihkan karakter XML yang tidak valid
+            const escapeXml = (unsafe) => {
+                if(!unsafe) return "";
+                return unsafe.replace(/[<>&'"]/g, c => {
+                    switch (c) {
+                        case '<': return '&lt;';
+                        case '>': return '&gt;';
+                        case '&': return '&amp;';
+                        case '\'': return '&apos;';
+                        case '"': return '&quot;';
+                        default: return c;
+                    }
+                });
+            };
+
+            // CSS Standar EPUB
+            stylesFolder.file("style.css", `
+                body { font-family: serif; margin: 5%; text-align: justify; line-height: 1.6; }
+                h1, h2, h3 { text-align: center; margin-bottom: 1em; }
+                p { text-indent: 1.5em; margin: 0 0 0.5em 0; }
+                p:first-of-type { text-indent: 0; }
+                .drop-cap:first-letter { font-size: 3em; float: left; margin: 0.1em 0.1em 0 0; font-weight: bold; }
+                .center { text-align: center; text-indent: 0; }
+            `);
+
+            let manifestItems = '';
+            let spineItems = '';
+            let ncxNavPoints = '';
+            let playOrder = 1;
+            let coverMeta = '';
+
+            const uid = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : 'id-' + Math.random().toString(36).substr(2, 9);
+
+            // Handle Cover Image (Penting untuk Google Play Books)
+            const coverImageSrc = coverImages[currentNovel?.id];
+            if (coverImageSrc && coverImageSrc.startsWith('data:image')) {
+                const mimeType = coverImageSrc.match(/data:(.*?);/)[1];
+                let extension = 'jpeg';
+                if (mimeType.includes('png')) extension = 'png';
+                if (mimeType.includes('webp')) extension = 'webp';
+                const base64Data = coverImageSrc.split(',')[1];
+                
+                imagesFolder.file(`cover.${extension}`, base64Data, { base64: true });
+                
+                textFolder.file("cover.xhtml", `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Cover</title><style type="text/css">body { text-align:center; padding:0; margin:0; } img { max-width:100%; height:100vh; object-fit:contain; }</style></head>
+<body>
+  <img src="../Images/cover.${extension}" alt="Cover" />
+</body>
+</html>`);
+
+                manifestItems += `<item id="cover-image" href="Images/cover.${extension}" media-type="${mimeType}" properties="cover-image"/>\n`;
+                manifestItems += `<item id="cover" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>\n`;
+                spineItems += `<itemref idref="cover"/>\n`;
+                ncxNavPoints += `<navPoint id="navPoint-${playOrder}" playOrder="${playOrder}"><navLabel><text>Sampul Depan</text></navLabel><content src="Text/cover.xhtml"/></navPoint>\n`;
+                coverMeta = `<meta name="cover" content="cover-image" />`;
+                playOrder++;
+            }
+
+            // Halaman Judul & Redaksi
+            textFolder.file("title.xhtml", `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>${escapeXml(bookPrintData.title)}</title><link href="../Styles/style.css" rel="stylesheet" type="text/css"/></head>
+<body>
+  <br/><br/><br/>
+  <h1>${escapeXml(bookPrintData.title)}</h1>
+  <h2>Oleh: ${escapeXml(bookPrintData.author)}</h2>
+  <br/><br/><br/>
+  <p class="center">Penerbit: ${escapeXml(bookPrintData.publisher)}</p>
+  <p class="center">Tahun Terbit: ${escapeXml(bookPrintData.publishYear)}</p>
+  ${bookPrintData.isbn ? `<p class="center">ISBN: ${escapeXml(bookPrintData.isbn)}</p>` : ''}
+</body>
+</html>`);
+            manifestItems += `<item id="title" href="Text/title.xhtml" media-type="application/xhtml+xml"/>\n`;
+            spineItems += `<itemref idref="title"/>\n`;
+            ncxNavPoints += `<navPoint id="navPoint-${playOrder}" playOrder="${playOrder}"><navLabel><text>Halaman Judul</text></navLabel><content src="Text/title.xhtml"/></navPoint>\n`;
+            playOrder++;
+
+            // Halaman Sinopsis
+            if (bookPrintData.synopsis) {
+                textFolder.file("synopsis.xhtml", `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Sinopsis</title><link href="../Styles/style.css" rel="stylesheet" type="text/css"/></head>
+<body>
+  <h2>Sinopsis</h2>
+  <p>${escapeXml(bookPrintData.synopsis).replace(/\n/g, '</p><p>')}</p>
+</body>
+</html>`);
+                manifestItems += `<item id="synopsis" href="Text/synopsis.xhtml" media-type="application/xhtml+xml"/>\n`;
+                spineItems += `<itemref idref="synopsis"/>\n`;
+                ncxNavPoints += `<navPoint id="navPoint-${playOrder}" playOrder="${playOrder}"><navLabel><text>Sinopsis</text></navLabel><content src="Text/synopsis.xhtml"/></navPoint>\n`;
+                playOrder++;
+            }
+
+            // Semua Episode/Bab
+            bookPrintData.episodes.forEach((ep) => {
+                if (ep.content && ep.content.length > 50) {
+                    const id = `chapter_${ep.episodeNumber}`;
+                    const displayTitle = ep.title.replace(/^Episode\s*\d+[:\-\s]*/i, '').trim();
+                    const escapedTitle = escapeXml(displayTitle);
+                    
+                    const paragraphs = ep.content.split(/\n\n+/).map(p => `<p>${escapeXml(p)}</p>`).join('\n');
+
+                    textFolder.file(`${id}.xhtml`, `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Episode ${ep.episodeNumber}</title><link href="../Styles/style.css" rel="stylesheet" type="text/css"/></head>
+<body>
+  <h2>Episode ${ep.episodeNumber}<br/>${escapedTitle}</h2>
+  <div class="drop-cap">
+    ${paragraphs}
+  </div>
+</body>
+</html>`);
+                    manifestItems += `<item id="${id}" href="Text/${id}.xhtml" media-type="application/xhtml+xml"/>\n`;
+                    spineItems += `<itemref idref="${id}"/>\n`;
+                    ncxNavPoints += `<navPoint id="navPoint-${playOrder}" playOrder="${playOrder}"><navLabel><text>Episode ${ep.episodeNumber}: ${escapedTitle}</text></navLabel><content src="Text/${id}.xhtml"/></navPoint>\n`;
+                    playOrder++;
+                }
+            });
+
+            // OPF (Package Document)
+            oebps.file("content.opf", `<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>${escapeXml(bookPrintData.title)}</dc:title>
+    <dc:creator opf:role="aut">${escapeXml(bookPrintData.author)}</dc:creator>
+    <dc:language>id</dc:language>
+    <dc:identifier id="BookId">urn:uuid:${uid}</dc:identifier>
+    ${coverMeta}
+  </metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="style" href="Styles/style.css" media-type="text/css"/>
+    ${manifestItems}
+  </manifest>
+  <spine toc="ncx">
+    ${spineItems}
+  </spine>
+</package>`);
+
+            // NCX (Navigasi / Daftar Isi TOC Interaktif)
+            oebps.file("toc.ncx", `<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="urn:uuid:${uid}"/>
+    <meta name="dtb:depth" content="1"/>
+    <meta name="dtb:totalPageCount" content="0"/>
+    <meta name="dtb:maxPageNumber" content="0"/>
+  </head>
+  <docTitle>
+    <text>${escapeXml(bookPrintData.title)}</text>
+  </docTitle>
+  <navMap>
+    ${ncxNavPoints}
+  </navMap>
+</ncx>`);
+
+            // Kompresi dan Unduh
+            const blob = await zip.generateAsync({ type: "blob", mimeType: "application/epub+zip" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${bookPrintData.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.epub`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            setMessage("Buku EPUB berhasil diunduh!");
+        } catch (error) {
+            console.error("EPUB Generation Error:", error);
+            setMessage("Gagal membuat EPUB: " + error.message);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleEnterReaderMode = () => {
+        if (!currentNovel || !currentNovel.episodes) return;
+        const sortedEpisodes = [...currentNovel.episodes].sort((a, b) => a.episodeNumber - b.episodeNumber);
+        const idx = sortedEpisodes.findIndex(e => e.episodeNumber === selectedEpisodeNumber);
+        setReadingEpisodeIndex(idx >= 0 ? idx : 0);
+        setView('reader');
+    };
+
+    const handleNextPage = () => {
+        if (!currentNovel) return;
+        const sortedEpisodes = [...currentNovel.episodes].sort((a, b) => a.episodeNumber - b.episodeNumber);
+        if (readingEpisodeIndex < sortedEpisodes.length - 1) {
+            setReadingEpisodeIndex(prev => prev + 1);
+            setSelectedEpisodeNumber(sortedEpisodes[readingEpisodeIndex + 1].episodeNumber);
+        }
+    };
+
+    const handlePrevPage = () => {
+        if (readingEpisodeIndex > 0) {
+            setReadingEpisodeIndex(prev => prev - 1);
+            if (currentNovel && currentNovel.episodes) {
+                 const sortedEpisodes = [...currentNovel.episodes].sort((a, b) => a.episodeNumber - b.episodeNumber);
+                 setSelectedEpisodeNumber(sortedEpisodes[readingEpisodeIndex - 1].episodeNumber);
+            }
+        }
+    };
+
+    const handleNextEpisodeDetail = () => {
+        if (!currentNovel || !currentNovel.episodes) return;
+        const sortedEpisodes = [...currentNovel.episodes].sort((a, b) => a.episodeNumber - b.episodeNumber);
+        const currentIndex = sortedEpisodes.findIndex(e => e.episodeNumber === selectedEpisodeNumber);
+        if (currentIndex < sortedEpisodes.length - 1) {
+            setSelectedEpisodeNumber(sortedEpisodes[currentIndex + 1].episodeNumber);
+        }
+    };
+
+    const handlePrevEpisodeDetail = () => {
+        if (!currentNovel || !currentNovel.episodes) return;
+        const sortedEpisodes = [...currentNovel.episodes].sort((a, b) => a.episodeNumber - b.episodeNumber);
+        const currentIndex = sortedEpisodes.findIndex(e => e.episodeNumber === selectedEpisodeNumber);
+        if (currentIndex > 0) {
+            setSelectedEpisodeNumber(sortedEpisodes[currentIndex - 1].episodeNumber);
+        }
+    };
+    
+    const handleSearchPlotByTitle = async () => {
+        if (!searchTitle || !storyType) return setMessage("Isi judul dan jenis cerita.");
+        setLoading(true); setMessage("Sedang mencari ide cerita yang menarik...");
+        try {
+            let versionContext = "";
+            let biographyInstruction = "";
+
+            if (epicVersion && (storyType === 'Epos Mahabaratha' || storyType === 'Ramayana')) { 
+                versionContext = `Versi Cerita: ${epicVersion}.`; 
+            }
+            
+            if (storyType === 'Biografi Tokoh') {
+                biographyInstruction = "FOKUS KHUSUS: Susun alur kronologis lengkap perjalanan hidup tokoh ini dari LAHIR/ASAL-USUL hingga MENINGGAL/WAFAT/MOKSA.";
+            }
+
+            const prompt = `Buatkan struktur alur cerita lengkap (Awal, Tengah, Akhir) untuk novel berjudul "${searchTitle}". Jenis: ${storyType}. ${versionContext} ${biographyInstruction} Output plain text yang detail dalam Bahasa Indonesia.`;
+            const res = await callGeminiAPI(prompt, setLoading);
+            setFullPlot(res); setNewNovelTitle(searchTitle); setNewNovelGenre(storyType); setGeneratorView('develop'); setMessage("Alur ditemukan! Silakan edit atau langsung siapkan novel.");
+        } catch (e) { setMessage("Gagal mencari alur: " + e.message); } finally { setLoading(false); }
+    };
+
+    const handlePrepareNovelFromPlot = async () => {
+        if (!fullPlot || !newNovelTitle) return setMessage("Judul dan Alur Cerita harus diisi.");
+        setLoading(true); setMessage("Sedang menganalisis alur dan menyusun kerangka episode...");
+        try {
+            const author = authorNameSelection;
+            const targetEpisodes = parseInt(numEpisodesToGenerate) || 10;
+            
+            let bioInstruction = "";
+            if (newNovelGenre === 'Biografi Tokoh' || newNovelGenre === 'Biografi / Kisah Tokoh') {
+                bioInstruction = "Instruksi Khusus Biografi: Pecah cerita menjadi episode-episode yang mengurutkan fase hidup tokoh dari Lahir, Masa Kecil, Remaja, Dewasa, Puncak Karir, hingga Kematian/Wafat secara kronologis.";
+            }
+
+            const prompt = `Analisis alur cerita ini dan bagi menjadi ${targetEpisodes} episode. ${bioInstruction} Alur: ${fullPlot.substring(0, 5000)} Output JSON: { "mainCharacters": ["Nama1", "Nama2"], "episodes": [ { "number": 1, "outline": "Ringkasan kejadian di ep 1..." } ... ] }`;
+            const res = await callGeminiAPI(prompt, setLoading, true);
+            const parsed = parseAIResponse(res);
+            if (parsed && Array.isArray(parsed.episodes)) {
+                const novelData = { title: newNovelTitle, openingPlot: fullPlot, genre: newNovelGenre || 'Umum', authorName: author, mainCharacters: parsed.mainCharacters || [], totalEstimatedEpisodes: targetEpisodes, writingStyle: writingStyle, epicVersion: epicVersion, footnote: customFootnote, createdAt: new Date().toISOString() };
+                const novelRef = await addDoc(collection(db, `artifacts/${appId}/users/${userId}/novels`), novelData);
+                const batch = writeBatch(db);
+                const epCol = collection(db, `artifacts/${appId}/users/${userId}/novels`, novelRef.id, 'episodes');
+                parsed.episodes.forEach(ep => { const docRef = doc(epCol); batch.set(docRef, { episodeNumber: parseInt(ep.number), title: `Episode ${ep.number}`, plotOutline: ep.outline, content: '', charactersInvolved: parsed.mainCharacters || [], generatedAt: new Date().toISOString() }); });
+                await batch.commit(); setMessage("Novel berhasil disiapkan! Silakan mulai menulis episode."); handleSelectNovel({ ...novelData, id: novelRef.id });
+            } else { throw new Error("Gagal memproses respons AI."); }
+        } catch (e) { setMessage("Gagal menyiapkan novel: " + e.message); } finally { setLoading(false); }
+    };
+    
+    const handleCreateNovel = async () => {
+        if (!newNovelTitle.trim() || !newNovelOpeningPlot.trim()) return setMessage("Mohon isi judul dan alur pembuka.");
+        setLoading(true); setMessage("Sedang menulis Episode 1... Mohon tunggu.");
+        try {
+            const author = authorNameSelection;
+            const mainChars = newNovelMainCharacters.split(',').map(c => c.trim()).filter(Boolean);
+            let epicContext = ""; if (epicVersion && (newNovelGenre === 'Epos Mahabaratha' || newNovelGenre === 'Ramayana')) { epicContext = `VERSI/PAKEM: ${epicVersion} (WAJIB ikuti penokohan dan gaya bahasa versi ini).`; }
+            
+            let genreSpecificInstruction = "";
+            if (newNovelGenre === 'Biografi / Kisah Tokoh' || newNovelGenre === 'Biografi Tokoh') {
+                genreSpecificInstruction = "STRUKTUR BIOGRAFI: Mulailah cerita dari momen kelahiran, masa kecil, atau asal-usul tokoh tersebut. Fokus pada pembentukan karakter di masa awal.";
+            }
+
+            const novelData = { title: newNovelTitle, openingPlot: newNovelOpeningPlot, genre: newNovelGenre, tone: newNovelTone, authorName: author, totalEstimatedEpisodes: parseInt(newNovelEstimatedEpisodes) || 10, writingStyle: writingStyle, epicVersion: epicVersion, footnote: customFootnote, mainCharacters: mainChars, createdAt: new Date().toISOString() };
+            const forbiddenWordsInstruction = wordFilter.trim() ? `\n\nINSTRUKSI FILTER KATA (SANGAT PENTING): Daftar kata terlarang: ${wordFilter}. GANTI dengan sinonim.` : "";
+            const novelRef = await addDoc(collection(db, `artifacts/${appId}/users/${userId}/novels`), novelData);
+            
+            const prompt = `Anda adalah penulis novel profesional. Tulis episode pertama. 
+Novel: "${newNovelTitle}" oleh ${author} 
+Genre: ${newNovelGenre} | Nada: ${newNovelTone} | Gaya: ${writingStyle} 
+${epicContext} ${genreSpecificInstruction} 
+Plot Awal: ${newNovelOpeningPlot} 
+Tokoh: ${mainChars.join(', ')} 
+
+Instruksi Panjang Cerita: WAJIB menulis konten cerita antara ${targetWordCount} kata. 
+Instruksi Gaya Bahasa: DILARANG KERAS menggunakan kata-kata: "kosmik", "purba", "sejati", "bau mesiu". Ganti dengan istilah yang lebih membumi. 
+${forbiddenWordsInstruction} 
+
+Instruksi Format (PENTING): Tulis tanpa markdown tebal/miring (*). JANGAN tulis cerita dalam satu blok paragraf panjang! Pecah menjadi beberapa paragraf yang rapi dan nyaman dibaca.
+INSTRUKSI KEPATUHAN ALUR: Ikuti plot awal dengan sangat ketat. JANGAN menambahkan adegan aksi, perampok, musuh, atau pertarungan jika TIDAK DISEBUTKAN di dalam plot. Fokus pada cerita sesuai panduan.
+Instruksi Tagar: WAJIB sertakan MINIMAL 5 tagar yang unik dan sangat relevan dengan isi cerita episode ini.
+
+${EYD_INSTRUCTION}
+
+Format output JSON: { "title": "Judul Episode", "content": "Isi Cerita...", "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"] }`;
+            
+            const aiRes = await callGeminiAPI(prompt, setLoading, true);
+            const parsed = parseAIResponse(aiRes);
+            if (parsed) {
+                let finalContent = cleanTextFormat(applyWordFilter(parsed.content, wordFilter));
+                
+                const mandatoryTag = "#suyatnoabubakar";
+                let tagsArray = [mandatoryTag];
+                if (parsed.hashtags && Array.isArray(parsed.hashtags)) {
+                    const cleanTags = parsed.hashtags.map(t => t.trim().startsWith('#') ? t.trim() : `#${t.trim()}`).filter(t => t.toLowerCase() !== mandatoryTag.toLowerCase());
+                    tagsArray = [...tagsArray, ...cleanTags];
+                }
+                
+                let footnoteAppended = customFootnote && customFootnote.trim() ? `\n\n${customFootnote.trim()}` : "";
+                finalContent = finalContent + footnoteAppended + "\n\n" + tagsArray.join(' ');
+
+                await addDoc(collection(db, `artifacts/${appId}/users/${userId}/novels`, novelRef.id, 'episodes'), { episodeNumber: 1, title: parsed.title, content: finalContent, hashtags: [], plotOutline: "Pengenalan cerita.", charactersInvolved: mainChars, generatedAt: new Date().toISOString() });
+                setMessage("Novel berhasil dibuat!"); handleSelectNovel({ ...novelData, id: novelRef.id, episodes: [] }); resetCreateForm();
+            } else { throw new Error("Gagal parsing respon AI."); }
+        } catch (e) { console.error(e); setMessage(`Gagal membuat novel: ${e.message}`); } finally { setLoading(false); }
+    };
+    
+    const handleContinueNextEpisode = async () => {
+        if (!currentNovel || !nextEpisodePlotOutline.trim()) return setMessage("Isi ringkasan alur episode berikutnya.");
+        setLoading(true); setMessage("Sedang menulis cerita... Ini mungkin memakan waktu 30-60 detik.");
+        try {
+            const lastEp = currentNovel.episodes.filter(e => e.content).pop();
+            const nextNum = (lastEp?.episodeNumber || 0) + 1;
+            const chars = charactersForNextEpisode.split(',').map(c => c.trim()).filter(Boolean);
+            
+            let context = lastEp ? `Konteks Akhir Episode ${lastEp.episodeNumber} (SANGAT PENTING - LANJUTKAN DARI SINI): ...${lastEp.content.slice(-3000)}` : `Plot Awal Novel: ${currentNovel.openingPlot}`;
+            let epicContext = ""; if (currentNovel.epicVersion) { epicContext = `VERSI/PAKEM: ${currentNovel.epicVersion} (WAJIB ikuti penokohan dan gaya bahasa versi ini).`; }
+            
+            const forbiddenWordsInstruction = wordFilter.trim() ? `\n\nINSTRUKSI FILTER KATA (SANGAT PENTING): Daftar kata terlarang: ${wordFilter}. GANTI dengan sinonim.` : "";
+            
+            const prompt = `Lanjutkan novel ini. Tulis Episode ${nextNum}. 
+Novel: "${currentNovel.title}" 
+${epicContext} 
+
+${context} 
+
+Alur Episode ${nextNum} (WAJIB DIIKUTI): ${nextEpisodePlotOutline} 
+Tokoh: ${chars.join(', ')} 
+
+Instruksi Kesinambungan (SANGAT PENTING): AWAL PARAGRAF PADA EPISODE INI HARUS TERHUBUNG LANGSUNG SECARA LOGIS DAN MULUS DENGAN "Konteks Akhir Episode Sebelumnya". Jangan membuat lompatan waktu atau adegan yang membingungkan.
+Instruksi Panjang Cerita: WAJIB menulis konten cerita antara ${targetWordCount} kata. 
+Instruksi Gaya Bahasa: PENTING: Jangan gunakan kata "kosmik", "purba", "sejati", atau "bau mesiu". Ganti dengan istilah yang lebih membumi. 
+${forbiddenWordsInstruction} 
+
+Instruksi Format (PENTING): Tulis tanpa markdown tebal/miring (*). JANGAN tulis cerita dalam satu blok paragraf panjang! Pecah menjadi beberapa paragraf yang rapi dan nyaman dibaca.
+INSTRUKSI KEPATUHAN ALUR: Ikuti Alur Episode dengan sangat ketat. JANGAN menambahkan konflik acak, perampok, atau adegan pertarungan jika tidak ada di dalam ringkasan alur.
+Instruksi Tagar: WAJIB sertakan MINIMAL 5 tagar yang unik dan sangat relevan dengan isi cerita episode ini.
+
+${EYD_INSTRUCTION}
+
+Format output JSON: { "title": "Judul Episode", "content": "Isi Cerita...", "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"] }`;
+            
+            const aiRes = await callGeminiAPI(prompt, setLoading, true);
+            const parsed = parseAIResponse(aiRes);
+            if (parsed) {
+                let finalContent = cleanTextFormat(applyWordFilter(parsed.content, wordFilter));
+                
+                const mandatoryTag = "#suyatnoabubakar";
+                let tagsArray = [mandatoryTag];
+                if (parsed.hashtags && Array.isArray(parsed.hashtags)) {
+                    const cleanTags = parsed.hashtags.map(t => t.trim().startsWith('#') ? t.trim() : `#${t.trim()}`).filter(t => t.toLowerCase() !== mandatoryTag.toLowerCase());
+                    tagsArray = [...tagsArray, ...cleanTags];
+                }
+                
+                let footnoteAppended = currentNovel.footnote && currentNovel.footnote.trim() ? `\n\n${currentNovel.footnote.trim()}` : "";
+                finalContent = finalContent + footnoteAppended + "\n\n" + tagsArray.join(' ');
+
+                const epData = { title: parsed.title, content: finalContent, hashtags: [], plotOutline: nextEpisodePlotOutline, charactersInvolved: chars, editedAt: new Date().toISOString() };
+                const existing = currentNovel.episodes.find(e => e.episodeNumber === nextNum);
+                const collectionRef = collection(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id, 'episodes');
+                if (existing) { await updateDoc(doc(collectionRef, existing.id), epData); } else { await addDoc(collectionRef, { ...epData, episodeNumber: nextNum, generatedAt: new Date().toISOString() }); }
+                setMessage(`Episode ${nextNum} selesai!`); setSelectedEpisodeNumber(nextNum); setNextEpisodePlotOutline(''); 
+            }
+        } catch (e) { setMessage(`Gagal: ${e.message}`); } finally { setLoading(false); }
+    };
+
+    const handleConfirmRegenerate = async () => {
+        setShowRegenerateConfirm(false); if (!currentNovel || !selectedEpisodeNumber) return;
+        const currentEp = currentNovel.episodes?.find(e => e.episodeNumber === selectedEpisodeNumber);
+        if (!currentEp) return setMessage("Episode tidak ditemukan.");
+        setLoading(true); setMessage(`Sedang menulis ulang Episode ${selectedEpisodeNumber}...`);
+        try {
+            let context = ""; 
+            if (selectedEpisodeNumber > 1) { 
+                const prevEp = currentNovel.episodes.find(e => e.episodeNumber === selectedEpisodeNumber - 1); 
+                if (prevEp && prevEp.content) { 
+                    context = `Konteks Akhir Episode ${selectedEpisodeNumber - 1} (SANGAT PENTING - LANJUTKAN DARI SINI): ...${prevEp.content.slice(-3000)}`; 
+                } 
+            } else { 
+                context = `Plot Awal Novel: ${currentNovel.openingPlot}`; 
+            }
+            
+            let epicContext = ""; if (currentNovel.epicVersion) { epicContext = `VERSI/PAKEM: ${currentNovel.epicVersion} (WAJIB ikuti penokohan dan gaya bahasa versi ini).`; }
+            const forbiddenWordsInstruction = wordFilter.trim() ? `\n\nINSTRUKSI FILTER KATA (SANGAT PENTING): Daftar kata terlarang: ${wordFilter}. GANTI dengan sinonim.` : "";
+            const outline = currentEp.plotOutline || "Kembangkan cerita menarik yang relevan untuk episode ini.";
+            const chars = currentEp.charactersInvolved && currentEp.charactersInvolved.length > 0 ? currentEp.charactersInvolved.join(', ') : (currentNovel.mainCharacters ? currentNovel.mainCharacters.join(', ') : '');
+            
+            const prompt = `Peran: Novelis Profesional. Tugas: Tulis ulang (Regenerate) konten untuk Episode ${selectedEpisodeNumber}. 
+Novel: "${currentNovel.title}" 
+Genre: ${currentNovel.genre} 
+${epicContext} 
+
+${context} 
+
+Panduan Alur (WAJIB): ${outline} 
+Tokoh Terlibat: ${chars} 
+
+Instruksi Kesinambungan (SANGAT PENTING): AWAL PARAGRAF PADA EPISODE INI HARUS TERHUBUNG LANGSUNG SECARA LOGIS DAN MULUS DENGAN "Konteks Akhir Episode Sebelumnya" (Jika ada). Jangan melompat tiba-tiba.
+Instruksi Panjang Cerita: WAJIB menulis konten cerita antara ${targetWordCount} kata. 
+Instruksi Gaya & Format: Tulis dalam Bahasa Indonesia yang mengalir. Fokus pada "Show, Don't Tell". LARANGAN KATA: Jangan pakai kata "kosmik", "purba", "sejati", "bau mesiu". Ganti kata. 
+${forbiddenWordsInstruction} 
+
+Instruksi Format (PENTING): Tulis tanpa markdown tebal/miring (*). JANGAN tulis cerita dalam satu blok paragraf panjang! Pecah menjadi beberapa paragraf yang rapi dan nyaman dibaca.
+INSTRUKSI KEPATUHAN ALUR: Ikuti Panduan Alur dengan sangat ketat. JANGAN menciptakan musuh tiba-tiba, perampokan, atau pertarungan fisik jika tidak disebutkan secara spesifik dalam panduan alur.
+Instruksi Tagar: WAJIB sertakan MINIMAL 5 tagar yang unik dan sangat relevan dengan isi cerita episode ini. 
+
+${EYD_INSTRUCTION}
+
+Format Output JSON: { "title": "Judul Episode Baru", "content": "Isi Cerita Lengkap...", "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"] }`;
+            
+            const aiRes = await callGeminiAPI(prompt, setLoading, true);
+            const parsed = parseAIResponse(aiRes);
+            if (parsed) {
+                let finalContent = cleanTextFormat(applyWordFilter(parsed.content, wordFilter));
+                
+                const mandatoryTag = "#suyatnoabubakar";
+                let tagsArray = [mandatoryTag];
+                if (parsed.hashtags && Array.isArray(parsed.hashtags)) {
+                    const cleanTags = parsed.hashtags.map(t => t.trim().startsWith('#') ? t.trim() : `#${t.trim()}`).filter(t => t.toLowerCase() !== mandatoryTag.toLowerCase());
+                    tagsArray = [...tagsArray, ...cleanTags];
+                }
+                
+                let footnoteAppended = currentNovel.footnote && currentNovel.footnote.trim() ? `\n\n${currentNovel.footnote.trim()}` : "";
+                finalContent = finalContent + footnoteAppended + "\n\n" + tagsArray.join(' ');
+
+                const epRef = doc(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id, 'episodes', currentEp.id);
+                await updateDoc(epRef, { title: parsed.title, content: finalContent, hashtags: [], generatedAt: new Date().toISOString() });
+                setMessage(`Episode ${selectedEpisodeNumber} berhasil ditulis ulang!`);
+            } else { throw new Error("Gagal memproses hasil dari AI."); }
+        } catch (e) { setMessage(`Gagal regenerate: ${e.message}`); } finally { setLoading(false); }
+    };
+
+    const handleUpdateFootnoteSetting = async () => {
+        if (!currentNovel) return;
+        setLoading(true);
+        try {
+            const novelRef = doc(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id);
+            await updateDoc(novelRef, { footnote: settingFootnote });
+            setCurrentNovel(prev => ({ ...prev, footnote: settingFootnote }));
+            setMessage("Catatan kaki berhasil diperbarui.");
+        } catch (e) {
+            setMessage("Gagal menyimpan catatan kaki: " + e.message);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    // --- OTHER HANDLERS ---
+    const handleAdaptLocationChange = (e) => { const val = e.target.value; setAdaptLocation(val); setAdaptEra(''); const loc = indonesianLocationsAndEras.find(l => l.region === val); setAvailableEras(loc ? loc.eras : []); };
+    const handleSelectNovel = (novel) => { setCurrentNovel(novel); setView('novelDetail'); setSelectedEpisodeNumber(1); setMessage(''); };
+    const handleDeleteNovel = async () => { if (!currentNovel) return; setLoading(true); setMessage("Menghapus novel..."); try { const novelRef = doc(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id); const eps = await getDocs(collection(novelRef, 'episodes')); const batch = writeBatch(db); eps.forEach(d => batch.delete(d.ref)); batch.delete(novelRef); await batch.commit(); setView('novelList'); setShowDeleteConfirm(false); setMessage("Novel dihapus."); } catch (e) { setMessage("Gagal menghapus: " + e.message); } finally { setLoading(false); } };
+    const handleDeleteEpisode = async () => { if (!currentNovel || !selectedEpisodeNumber) return; const episodeToDelete = currentNovel.episodes?.find(e => e.episodeNumber === selectedEpisodeNumber); if (!episodeToDelete) { setMessage("Episode tidak ditemukan."); setShowEpisodeDeleteConfirm(false); return; } setLoading(true); setMessage(`Menghapus Episode ${selectedEpisodeNumber}...`); try { await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id, 'episodes', episodeToDelete.id)); const remainingEpisodes = currentNovel.episodes.filter(e => e.id !== episodeToDelete.id); if (remainingEpisodes.length > 0) { const prev = remainingEpisodes.filter(e => e.episodeNumber < selectedEpisodeNumber).pop(); const next = remainingEpisodes.find(e => e.episodeNumber > selectedEpisodeNumber); const target = prev || next || remainingEpisodes[0]; setSelectedEpisodeNumber(target.episodeNumber); } else { setSelectedEpisodeNumber(1); setCurrentEpisodeContent(''); } setShowEpisodeDeleteConfirm(false); setMessage("Episode berhasil dihapus."); } catch (e) { setMessage("Gagal menghapus episode: " + e.message); } finally { setLoading(false); } };
+    
+    const handleSaveSettings = async () => { 
+        if(!userId) return; 
+        setLoading(true); 
+        setMessage("Menyimpan pengaturan..."); 
+        try { 
+            await setDoc(doc(db, `artifacts/${appId}/users/${userId}/settings`, "appSettings"), { 
+                apiKey, 
+                wordFilter, 
+                appTheme,
+                customAuthors 
+            }, { merge: true }); 
+            setShowSettings(false); 
+            setMessage("Pengaturan disimpan."); 
+        } catch (e) { 
+            setMessage("Gagal simpan setting: " + e.message); 
+        } finally { 
+            setLoading(false); 
+        } 
+    };
+
+    // --- AUTHOR MANAGEMENT HANDLERS ---
+    const handleAddAuthor = () => {
+        if (newAuthorInput.trim() && !customAuthors.includes(newAuthorInput.trim())) {
+            setCustomAuthors([...customAuthors, newAuthorInput.trim()]);
+            setNewAuthorInput('');
+        }
+    };
+    
+    const handleDeleteAuthor = (index) => {
+        const updated = customAuthors.filter((_, i) => i !== index);
+        setCustomAuthors(updated.length > 0 ? updated : DEFAULT_AUTHORS);
+        if (authorNameSelection === customAuthors[index] && updated.length > 0) {
+            setAuthorNameSelection(updated[0]);
+        }
+    };
+
+    const startEditAuthor = (index, name) => {
+        setEditingAuthorIndex(index);
+        setEditAuthorInput(name);
+    };
+
+    const saveEditAuthor = (index) => {
+        if (editAuthorInput.trim()) {
+            const updated = [...customAuthors];
+            // Update selected author if it was the one being edited
+            if (authorNameSelection === updated[index]) {
+                setAuthorNameSelection(editAuthorInput.trim());
+            }
+            updated[index] = editAuthorInput.trim();
+            setCustomAuthors(updated);
+        }
+        setEditingAuthorIndex(null);
+        setEditAuthorInput('');
+    };
+
+    const handleGeneratePlotIdea = async () => { const prompt = `Berikan 3 ide plot singkat untuk kelanjutan novel "${currentNovel.title}". Genre: ${currentNovel.genre}. Konteks terakhir: ...${currentEpisodeContent.slice(-300)}.`; try { const res = await callGeminiAPI(prompt, setIsGeneratingPlot); setNextEpisodePlotOutline(res); } catch (e) {} };
+    
+    const handleGeneratePoster = async (episode) => {
+        if (!episode) return;
+        setIsGeneratingPosterPrompt(true);
+        setMessage("Merancang prompt poster episode...");
+        
+        try {
+            const characters = episode.charactersInvolved && episode.charactersInvolved.length > 0
+                ? episode.charactersInvolved.join(', ')
+                : (Array.isArray(currentNovel.mainCharacters) && currentNovel.mainCharacters.length > 0
+                    ? currentNovel.mainCharacters.join(', ')
+                    : 'tokoh yang disebutkan dalam cerita');
+
+            const genrePrompt = currentNovel.genre || 'Drama';
+            const novelTitle = currentNovel.title || 'Tanpa judul';
+            const episodeTitle = episode.title || `Episode ${episode.episodeNumber}`;
+            const episodeNumberLabel = `#${String(Number(episode.episodeNumber) || 1).padStart(2, '0')}`;
+            const authorLabel = currentNovel.authorName || currentNovel.author || 'Nama Penulis';
+            const sceneSnippet = [
+                episode.plotOutline ? `Rangkuman alur episode: ${episode.plotOutline}` : '',
+                episode.content ? `Isi episode: ${episode.content.slice(0, 1800)}` : ''
+            ].filter(Boolean).join('\n\n') || 'Belum ada isi episode. Buat visual berdasarkan judul episode dan genre, tanpa mengarang detail plot yang spesifik.';
+
+            const prompt = `Peran: Ahli prompt ilustrasi sinematik untuk sampul episode novel.
+Tugas: Tulis SATU prompt visual final dalam Bahasa Indonesia untuk menghasilkan sampul/poster episode yang menarik, kuat secara emosional, dan benar-benar sesuai dengan peristiwa dalam episode.
+
+DATA CERITA:
+- Judul novel yang wajib ditampilkan: ${novelTitle}
+- Nomor episode yang wajib ditampilkan: ${episodeNumberLabel}
+- Judul episode yang wajib ditampilkan: ${episodeTitle}
+- Nama penulis yang wajib ditampilkan: ${authorLabel}
+- Genre: ${genrePrompt}
+- Tokoh yang terlibat (gunakan nama saja): ${characters}
+- Rangkuman/teks episode:
+${sceneSnippet}
+
+ARAHAN WAJIB:
+1. Tentukan satu momen paling dramatis, emosional, misterius, romantis, menegangkan, atau menentukan dari isi episode. Jadikan momen itu fokus utama ilustrasi; jangan membuat adegan generik yang tidak berhubungan dengan cerita.
+2. Gambarkan latar tempat, waktu, cuaca, pencahayaan, suasana, aksi, ekspresi emosi, komposisi, sudut kamera, kedalaman bidang, dan palet warna sesuai petunjuk yang benar-benar ada dalam cerita. Jika detail tidak disebutkan, pilih detail visual yang masuk akal berdasarkan konteks dan genre tanpa mengubah alur.
+3. Tokoh harus disebut dengan NAMA saja: ${characters}. Jangan menjelaskan atau mengarang ciri fisik, pakaian, usia, rambut, warna kulit, atau bentuk wajah tokoh karena setiap tokoh akan dibuat menggunakan gambar referensi. Tegaskan agar identitas/penampilan tokoh mengikuti gambar referensi yang diberikan.
+4. Buat komposisi sampul episode profesional dengan fokus visual jelas, dramatis, sinematik, detail tinggi, pencahayaan terarah, tata letak rapi, dan kualitas ilustrasi premium. Sisakan ruang yang cukup untuk teks agar tidak menutupi adegan utama. Hindari visual berantakan, anatomi cacat, anggota tubuh tambahan, watermark, dan teks acak.
+5. Tampilkan EMPAT elemen teks ini dengan ejaan persis seperti yang diberikan dan hierarki tata letak berikut:
+   - PALING ATAS: nomor episode “${episodeNumberLabel}”, tepat di atas judul novel, ukuran kecil hingga sedang tetapi jelas terbaca.
+   - DI BAWAH NOMOR EPISODE: judul novel “${novelTitle}” sebagai judul utama di bagian atas sampul, ukuran paling besar, paling menonjol, dengan tipografi profesional yang sesuai genre.
+   - TEPAT DI BAWAH JUDUL NOVEL: judul episode “${episodeTitle}”, ukuran lebih kecil daripada judul novel tetapi tetap jelas terbaca.
+   - BAGIAN BAWAH TENGAH SAMPUL: nama penulis “${authorLabel}”, ukuran kecil, rapi, elegan, dan tetap terbaca.
+   Atur semua teks secara terpusat dan berjenjang, dengan jarak yang seimbang serta kontras memadai terhadap latar. Pastikan nomor episode berada di atas judul novel, bukan di samping atau di bawahnya. Nama penulis harus berada di bawah tengah, bukan di pojok. Jangan menghilangkan, mengganti, menerjemahkan, atau salah mengeja keempat teks tersebut. Jangan tambahkan teks lain, tagline, label, atau tulisan dekoratif.
+6. Seluruh prompt harus berbahasa Indonesia, ringkas tetapi spesifik dan siap langsung disalin ke generator gambar. Jangan sertakan penjelasan, pengantar, daftar analisis, atau tanda kutip pembungkus.
+
+KELUARAN: Hanya satu prompt final berbahasa Indonesia.`;
+
+            const res = await callGeminiAPI(prompt, setIsGeneratingPosterPrompt);
+            setActivePosterPrompt(res);
+            setShowPosterPromptModal(true);
+            setMessage("Prompt poster episode siap!");
+        } catch (e) {
+            setMessage("Gagal membuat prompt: " + e.message);
+        } finally {
+            setIsGeneratingPosterPrompt(false);
+        }
+    };
+
+    const handleUpdateTitle = async () => { if (!tempTitle.trim() || !currentNovel) return; setLoading(true); try { const novelRef = doc(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id); await updateDoc(novelRef, { title: tempTitle }); setCurrentNovel(prev => ({ ...prev, title: tempTitle })); setIsEditingTitle(false); setMessage("Judul novel berhasil diubah."); } catch (e) { setMessage("Gagal mengubah judul: " + e.message); } finally { setLoading(false); } };
+    const copyToClipboard = (text, type) => { if (!text) return; const textArea = document.createElement("textarea"); textArea.value = text; document.body.appendChild(textArea); textArea.select(); document.execCommand('copy'); document.body.removeChild(textArea); setCopySuccess(type); setTimeout(() => setCopySuccess(''), 2000); };
+    
+    const resetCreateForm = () => { 
+        setNewNovelTitle(''); 
+        setNewNovelOpeningPlot(''); 
+        setNewNovelMainCharacters(''); 
+        setNewNovelGenre(''); 
+        setNewNovelTone(''); 
+        setAuthorNameSelection(customAuthors[0] || DEFAULT_AUTHORS[0]); 
+        setFullPlot(''); 
+        setEpicVersion(''); 
+        setCustomFootnote(''); // Reset footnote
+    };
+    
+    const handleSaveEditedEpisode = async () => { if (!editingEpisodeId) return; setLoading(true); setMessage("Menyimpan perubahan..."); const ref = doc(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id, 'episodes', editingEpisodeId); await updateDoc(ref, { content: editedEpisodeContent, title: editedEpisodeTitle }); setEditingEpisodeId(null); setLoading(false); };
+    const handleGenerateSynopsis = async () => { if (!currentNovel) return; setIsGeneratingSynopsis(true); setMessage("Membaca seluruh episode dan menyusun sinopsis..."); try { const episodes = currentNovel.episodes || []; const sortedEpisodes = [...episodes].sort((a, b) => a.episodeNumber - b.episodeNumber); const writtenEpisodes = sortedEpisodes.filter(e => e.content && e.content.length > 100); let storyContext = ""; if (writtenEpisodes.length === 0) { storyContext = currentNovel.openingPlot || "Belum ada konten cerita."; } else { const first = writtenEpisodes[0]; const last = writtenEpisodes[writtenEpisodes.length - 1]; storyContext += `[AWAL CERITA - Ep ${first.episodeNumber}]: ${first.content.slice(0, 1000)}...\n\n`; if (writtenEpisodes.length > 2) { const midIndex = Math.floor(writtenEpisodes.length / 2); const mid = writtenEpisodes[midIndex]; storyContext += `[TENGAH CERITA - Ep ${mid.episodeNumber}]: ...${mid.content.slice(0, 1000)}...\n\n`; } storyContext += `[AKHIR SEJAUH INI - Ep ${last.episodeNumber}]: ...${last.content.slice(-1000)}`; } const prompt = `Peran: Editor Novel Profesional. Tugas: Buat SINOPSIS MENARIK (Blurb) untuk novel berjudul "${currentNovel.title}". Genre: ${currentNovel.genre} Tone: ${currentNovel.tone || 'Umum'} Ringkasan Isi Cerita (Sampel): ${storyContext} Instruksi: 1. Tulis sinopsis yang merangkum inti konflik, karakter utama, dan pertaruhan cerita. 2. Gaya bahasa harus MENJUAL dan PENGGUGAH. 3. Jangan terlalu teknis. 4. Panjang: 3-5 paragraf.`; const res = await callGeminiAPI(prompt, setIsGeneratingSynopsis); setGeneratedSynopsis(res); setShowSynopsisModal(true); setMessage("Sinopsis siap!"); } catch (e) { setMessage("Gagal membuat sinopsis: " + e.message); } finally { setIsGeneratingSynopsis(false); } };
+    const handleSaveSynopsis = async () => { if (!currentNovel) return; setLoading(true); try { const novelRef = doc(db, `artifacts/${appId}/users/${userId}/novels`, currentNovel.id); await updateDoc(novelRef, { openingPlot: generatedSynopsis }); setCurrentNovel(prev => ({...prev, openingPlot: generatedSynopsis})); setShowSynopsisModal(false); setMessage("Sinopsis novel diperbarui!"); } catch(e) { setMessage("Gagal simpan: " + e.message); } finally { setLoading(false); } };
+    const scanContentForMatches = (content, keyword) => { if (!keyword || !content) return []; const regex = new RegExp(keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'); const matches = []; let match; while ((match = regex.exec(content)) !== null) { const index = match.index; const start = Math.max(0, index - 40); const end = Math.min(content.length, index + keyword.length + 40); const contextText = content.substring(start, end); matches.push({ index: index, value: match[0], context: `...${contextText}...` }); } return matches; };
+    const handleSearchWords = () => { if (!findKeyword.trim()) return; setIsSearchingWords(true); const sourceContent = editingEpisodeId ? editedEpisodeContent : currentEpisodeContent; if (!editingEpisodeId && currentNovel && selectedEpisodeNumber) { const currentEp = currentNovel.episodes?.find(e => e.episodeNumber === selectedEpisodeNumber); if (currentEp) { setEditingEpisodeId(currentEp.id); setEditedEpisodeContent(currentEp.content); setEditedEpisodeTitle(currentEp.title); const matches = scanContentForMatches(currentEp.content, findKeyword); setFoundMatches(matches); } } else { const matches = scanContentForMatches(sourceContent, findKeyword); setFoundMatches(matches); } setIsSearchingWords(false); setAiWordSuggestions({}); setManualReplaceInput({}); };
+    const performReplace = (matchIndex, newWord) => { if (!editingEpisodeId) return; const match = foundMatches[matchIndex]; if (!match) return; let content = editedEpisodeContent; const before = content.substring(0, match.index); const after = content.substring(match.index + match.value.length); const newContent = before + newWord + after; setEditedEpisodeContent(newContent); const newMatches = scanContentForMatches(newContent, findKeyword); setFoundMatches(newMatches); setAiWordSuggestions({}); setManualReplaceInput({}); setMessage("Kata berhasil diganti."); };
+    const handleAIWordSuggestion = async (matchIndex) => { const match = foundMatches[matchIndex]; if (!match) return; setLoading(true); try { const prompt = `Berikan 3 kata sinonim atau alternatif yang lebih baik/sastra untuk kata "${match.value}" dalam potongan kalimat ini: "${match.context}". Output hanya daftar kata dipisahkan koma. Jangan ada teks lain. Bahasa Indonesia.`; const text = await callGeminiAPI(prompt, setLoading); const suggestions = text.split(',').map(s => s.trim().replace(/\./g, '')); setAiWordSuggestions(prev => ({ ...prev, [matchIndex]: suggestions })); } catch (e) { console.error(e); } finally { setLoading(false); } };
+
+    // --- RENDER VIEWS ---
+
+    const renderGlobalLoading = () => (
+        <div className="fixed inset-0 bg-black/80 flex flex-col items-center justify-center z-[100] p-4">
+             <div className="relative w-24 h-24 mb-6">
+                <div className="absolute top-0 left-0 w-full h-full border-4 border-[var(--bg-tertiary)] rounded-full"></div>
+                <div className="absolute top-0 left-0 w-full h-full border-4 border-t-[var(--accent-primary)] rounded-full animate-spin"></div>
+                <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-[var(--accent-primary)] text-3xl">
+                     <i className="fas fa-feather-alt animate-pulse"></i>
+                </div>
+            </div>
+            <h3 className="text-2xl font-bold text-white mb-2 animate-pulse">Satria AI Sedang Bekerja...</h3>
+            <p className="text-[var(--text-secondary)] text-center max-w-md">{message || "Mohon tunggu sebentar..."}</p>
+        </div>
+    );
+
+    const renderSettingsModal = () => (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+            <div className="bg-[var(--bg-secondary)] p-6 rounded-xl w-full max-w-md border border-[var(--bg-tertiary)] shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-xl font-bold text-[var(--text-primary)]">Pengaturan Aplikasi</h3>
+                    <span className="text-xs text-[var(--text-secondary)] bg-[var(--bg-tertiary)] px-2 py-1 rounded border border-[var(--bg-tertiary)]">{APP_VERSION}</span>
+                </div>
+                <div className="space-y-4">
+                    <div>
+                        <label className="block text-sm text-[var(--text-secondary)] mb-1">Google Gemini API Key</label>
+                        <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} className="w-full p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded border border-[var(--bg-tertiary)] focus:border-[var(--accent-primary)] outline-none" placeholder="AIzaSy..." />
+                    </div>
+                    <div>
+                        <label className="block text-sm text-[var(--text-secondary)] mb-1">Tema Aplikasi</label>
+                        <select value={appTheme} onChange={e => setAppTheme(e.target.value)} className="w-full p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded">
+                            {Object.entries(themes).map(([key, val]) => ( <option key={key} value={key}>{val.name}</option> ))}
+                        </select>
+                    </div>
+                    <div>
+                        <label className="block text-sm text-[var(--text-secondary)] mb-1">Filter Kata (Pisahkan koma)</label>
+                        <input type="text" value={wordFilter} onChange={e => setWordFilter(e.target.value)} className="w-full p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded" placeholder="kata1, kata2..." />
+                    </div>
+                    
+                    {/* MANAJEMEN PENULIS */}
+                    <div className="mt-4 border-t border-[var(--bg-tertiary)] pt-4">
+                        <label className="block text-sm text-[var(--text-secondary)] mb-2 font-bold">Kelola Nama Penulis</label>
+                        <div className="space-y-2 mb-3 max-h-40 overflow-y-auto pr-2">
+                            {customAuthors.map((author, idx) => (
+                                <div key={idx} className="flex justify-between items-center bg-[var(--bg-primary)] p-2 rounded border border-[var(--bg-tertiary)]">
+                                    {editingAuthorIndex === idx ? (
+                                        <div className="flex w-full gap-2">
+                                            <input type="text" value={editAuthorInput} onChange={e => setEditAuthorInput(e.target.value)} className="flex-1 bg-transparent outline-none text-sm text-[var(--text-primary)]" autoFocus />
+                                            <button onClick={() => saveEditAuthor(idx)} className="text-green-500 hover:text-green-400"><i className="fas fa-check"></i></button>
+                                            <button onClick={() => setEditingAuthorIndex(null)} className="text-red-500 hover:text-red-400"><i className="fas fa-times"></i></button>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <span className="text-sm text-[var(--text-primary)] truncate" title={author}>{author}</span>
+                                            <div className="flex gap-3">
+                                                <button onClick={() => startEditAuthor(idx, author)} className="text-[var(--text-secondary)] hover:text-blue-400 transition" title="Edit"><i className="fas fa-edit"></i></button>
+                                                <button onClick={() => handleDeleteAuthor(idx)} className="text-[var(--text-secondary)] hover:text-red-400 transition" title="Hapus"><i className="fas fa-trash"></i></button>
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                        <div className="flex gap-2">
+                            <input 
+                                type="text" 
+                                value={newAuthorInput} 
+                                onChange={e => setNewAuthorInput(e.target.value)} 
+                                onKeyDown={(e) => e.key === 'Enter' && handleAddAuthor()}
+                                placeholder="Tambah penulis baru..." 
+                                className="flex-1 p-2 bg-[var(--bg-primary)] text-[var(--text-primary)] rounded border border-[var(--bg-tertiary)] outline-none text-sm" 
+                            />
+                            <button onClick={handleAddAuthor} className="bg-[var(--accent-primary)] text-white px-3 py-2 rounded font-bold hover:bg-[var(--accent-secondary)]"><i className="fas fa-plus"></i></button>
+                        </div>
+                        <p className="text-[10px] text-[var(--text-secondary)] mt-2 italic">*Nama-nama di atas akan muncul sebagai pilihan saat Anda membuat novel baru. Jangan lupa klik <b>Simpan</b>.</p>
+                    </div>
+
+                </div>
+                <div className="mt-6 flex justify-end gap-3 pt-4 border-t border-[var(--bg-tertiary)]">
+                    <button onClick={() => setShowSettings(false)} className="px-4 py-2 rounded bg-gray-600 hover:bg-gray-700 text-white">Batal</button>
+                    <button onClick={handleSaveSettings} className="px-4 py-2 rounded bg-green-600 hover:bg-green-700 text-white font-bold">Simpan</button>
+                </div>
+            </div>
+        </div>
+    );
+
+    // --- NOVEL SETTINGS MODAL (NEW) ---
+    const renderNovelSettings = () => {
+        const currentCover = coverImages[currentNovel?.id];
+        return (
+            <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                <div className="bg-[var(--bg-secondary)] p-6 rounded-xl w-full max-w-2xl border border-[var(--bg-tertiary)] shadow-2xl overflow-y-auto max-h-[90vh]">
+                    <div className="flex justify-between items-center mb-6 border-b border-[var(--bg-tertiary)] pb-2">
+                        <h3 className="text-xl font-bold text-[var(--text-primary)]"><i className="fas fa-cog mr-2"></i>Pengaturan Novel</h3>
+                        <button onClick={() => setShowNovelSettings(false)} className="text-[var(--text-secondary)] hover:text-white"><i className="fas fa-times text-xl"></i></button>
+                    </div>
+                    
+                    <div className="bg-[var(--bg-primary)] p-4 rounded-lg border border-[var(--bg-tertiary)] mb-6">
+                         <h4 className="text-lg font-bold text-[var(--text-primary)] mb-4 border-b border-[var(--bg-tertiary)] pb-2">Sampul Novel (Cover)</h4>
+                         <div className="flex flex-col md:flex-row gap-6 items-center">
+                            <div className="w-full md:w-1/3 h-64 bg-[var(--bg-tertiary)] rounded-lg flex items-center justify-center overflow-hidden border border-[var(--bg-tertiary)] relative group">
+                                {currentCover ? (
+                                    <img src={currentCover} alt="Cover Novel" className="w-full h-full object-contain" />
+                                ) : (
+                                    <div className="text-center text-[var(--text-secondary)]">
+                                        <i className="fas fa-image text-4xl mb-2 opacity-50"></i>
+                                        <p className="text-xs">Belum ada sampul</p>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="flex-1 space-y-3 w-full">
+                                <p className="text-sm text-[var(--text-secondary)]">Sampul ini digunakan untuk halaman depan saat mengunduh PDF. Gambar disimpan di memori browser.</p>
+                                <div className="flex flex-col gap-2">
+                                     <label className="flex items-center justify-center p-3 bg-[var(--bg-tertiary)] hover:bg-[var(--bg-secondary)] text-[var(--text-primary)] rounded-lg cursor-pointer border border-[var(--bg-tertiary)] transition text-sm font-bold">
+                                        <i className="fas fa-upload mr-2"></i> Upload Gambar (Manual)
+                                        <input type="file" accept="image/*" className="hidden" onChange={handleUploadCover} />
+                                    </label>
+                                    <button 
+                                        onClick={handleGenerateCoverPrompt} 
+                                        disabled={isGeneratingCoverPrompt}
+                                        className="p-3 bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white rounded-lg transition text-sm font-bold flex items-center justify-center"
+                                    >
+                                        <i className="fas fa-magic mr-2"></i> {isGeneratingCoverPrompt ? 'Merancang Prompt...' : 'Buat Prompt Cover (AI)'}
+                                    </button>
+                                </div>
+                            </div>
+                         </div>
+                    </div>
+
+                    <div className="bg-[var(--bg-primary)] p-4 rounded-lg border border-[var(--bg-tertiary)] mb-6">
+                        <h4 className="text-lg font-bold text-[var(--text-primary)] mb-2">Catatan Kaki (Ditambahkan ke setiap akhir episode)</h4>
+                        <p className="text-sm text-[var(--text-secondary)] mb-3">Teks ini akan selalu ditambahkan secara otomatis setiap kali AI selesai menulis atau meregenerate episode untuk novel ini.</p>
+                        <textarea
+                            value={settingFootnote}
+                            onChange={(e) => setSettingFootnote(e.target.value)}
+                            placeholder="Misal: Bersambung... Ditulis ulang berdasarkan..."
+                            className="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] p-3 rounded mb-3 outline-none h-24"
+                        />
+                        <button onClick={handleUpdateFootnoteSetting} className="px-4 py-2 bg-[var(--accent-primary)] hover:bg-[var(--accent-secondary)] text-white rounded font-bold transition shadow-lg">Simpan Catatan Kaki</button>
+                    </div>
+
+                    <div className="flex justify-end">
+                        <button onClick={() => setShowNovelSettings(false)} className="px-6 py-2 bg-gray-600 text-white font-bold rounded hover:bg-gray-500 transition">Tutup</button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    const renderReaderMode = () => {
+        if (!currentNovel || !currentNovel.episodes) return null;
+        const sortedEpisodes = [...currentNovel.episodes].sort((a, b) => a.episodeNumber - b.episodeNumber);
+        const currentEp = sortedEpisodes[readingEpisodeIndex];
+        return (
+            <div className="min-h-screen bg-[#fdf6e3] text-[#333] flex flex-col font-serif">
+                <div className="sticky top-0 bg-[#fdf6e3] border-b border-[#e6e0cc] p-4 flex justify-between items-center z-10 shadow-sm">
+                    <div className="flex items-center gap-4">
+                         <button onClick={() => setView('novelDetail')} className="text-[#666] hover:text-black"><i className="fas fa-times text-xl"></i></button>
+                         <h2 className="font-bold text-lg text-[#2c3e50] truncate max-w-xs">{currentNovel.title}</h2>
+                    </div>
+                    <div className="text-sm text-[#666]">{currentEp ? `Episode ${currentEp.episodeNumber}` : ''}</div>
+                </div>
+                <div className="flex-1 max-w-3xl mx-auto w-full p-6 md:p-12 overflow-y-auto">
+                    {currentEp ? (
+                        <div className="prose prose-lg max-w-none text-justify leading-relaxed">
+                            <h1 className="text-3xl font-bold mb-8 text-center text-[#2c3e50]">{currentEp.title}</h1>
+                            <div className="whitespace-pre-wrap">{currentEp.content}</div>
+                        </div>
+                    ) : ( <div className="text-center py-20 text-gray-400">Belum ada konten untuk dibaca.</div> )}
+                </div>
+                <div className="sticky bottom-0 bg-[#fdf6e3] border-t border-[#e6e0cc] p-4 flex justify-between items-center shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)]">
+                    <button onClick={handlePrevPage} disabled={readingEpisodeIndex === 0} className="px-4 py-2 rounded bg-[#eee8d5] text-[#586e75] hover:bg-[#93a1a1] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition"><i className="fas fa-arrow-left mr-2"></i> Sebelumnya</button>
+                    <span className="text-sm text-[#666] font-mono">Hal {readingEpisodeIndex + 1} dari {sortedEpisodes.length}</span>
+                    <button onClick={handleNextPage} disabled={readingEpisodeIndex === sortedEpisodes.length - 1} className="px-4 py-2 rounded bg-[#eee8d5] text-[#586e75] hover:bg-[#93a1a1] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition">Selanjutnya <i className="fas fa-arrow-right ml-2"></i></button>
+                </div>
+            </div>
+        );
+    };
+
+    const renderNovelDetail = () => {
+        if (!currentNovel) return null;
+        const sortedEpisodes = [...(currentNovel.episodes || [])].sort((a, b) => a.episodeNumber - b.episodeNumber);
+        const currentEpIndex = sortedEpisodes.findIndex(e => e.episodeNumber === selectedEpisodeNumber);
+        const currentEp = sortedEpisodes[currentEpIndex];
+        const prevEp = currentEpIndex > 0 ? sortedEpisodes[currentEpIndex - 1] : null;
+        const nextEp = currentEpIndex < sortedEpisodes.length - 1 ? sortedEpisodes[currentEpIndex + 1] : null;
+
+        const contentToDisplay = editingEpisodeId === currentEp?.id ? editedEpisodeContent : currentEpisodeContent;
+        const charCount = contentToDisplay ? contentToDisplay.length : 0;
+        const wordCountVal = countWords(contentToDisplay);
+
+        return (
+            <div className="min-h-screen flex flex-col">
+                <div className="bg-[var(--bg-secondary)] border-b border-[var(--bg-tertiary)] p-4 sticky top-0 z-10 shadow-md">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                        <div className="flex items-center gap-4 flex-1 overflow-hidden">
+                            <button onClick={() => setView('novelList')} className="text-[var(--text-secondary)] hover:text-white flex-shrink-0"><i className="fas fa-arrow-left"></i></button>
+                            <div className="flex flex-col overflow-hidden w-full">
+                                {isEditingTitle ? (
+                                    <div className="flex items-center gap-2 w-full animate-fade-in">
+                                        <input type="text" value={tempTitle} onChange={(e) => setTempTitle(e.target.value)} className="bg-[var(--bg-tertiary)] text-[var(--text-primary)] p-1.5 rounded px-3 outline-none border border-[var(--accent-primary)] w-full font-bold" autoFocus placeholder="Judul Novel Baru" />
+                                        <button onClick={handleUpdateTitle} className="p-2 bg-green-600 hover:bg-green-500 text-white rounded shadow" title="Simpan Judul"><i className="fas fa-check"></i></button>
+                                        <button onClick={() => setIsEditingTitle(false)} className="p-2 bg-red-600 hover:bg-red-500 text-white rounded shadow" title="Batal"><i className="fas fa-times"></i></button>
+                                    </div>
+                                ) : (
+                                    <div className="group">
+                                        <div className="flex items-center gap-2">
+                                            <h2 className="font-bold text-[var(--text-primary)] truncate text-lg md:text-xl" title={currentNovel.title}>{currentNovel.title}</h2>
+                                            <button onClick={() => { setTempTitle(currentNovel.title); setIsEditingTitle(true); }} className="text-[var(--text-secondary)] hover:text-[var(--accent-primary)] opacity-0 group-hover:opacity-100 transition-all transform hover:scale-110" title="Ganti Judul Novel"><i className="fas fa-pencil-alt"></i></button>
+                                        </div>
+                                        <p className="text-xs text-[var(--text-secondary)] line-clamp-1 opacity-80 cursor-help" title={currentNovel.openingPlot || "Sinopsis belum ada."}>
+                                            {currentNovel.openingPlot || "Sinopsis belum ada."}
+                                        </p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                        <div className="flex gap-2 flex-shrink-0">
+                             <select value={selectedEpisodeNumber} onChange={e => setSelectedEpisodeNumber(Number(e.target.value))} className="bg-[var(--bg-tertiary)] text-[var(--text-primary)] text-sm rounded p-2 outline-none max-w-[150px] md:max-w-xs">
+                                {currentNovel.episodes?.map(ep => ( <option key={ep.id} value={ep.episodeNumber}>Ep {ep.episodeNumber}: {ep.title.substring(0,20)}...</option> ))}
+                            </select>
+                            
+                            <button onClick={() => { setSettingFootnote(currentNovel.footnote || ''); setShowNovelSettings(true); }} className="p-2 text-[var(--text-primary)] bg-[var(--bg-tertiary)] hover:bg-[var(--accent-primary)] hover:text-white rounded" title="Pengaturan Novel / Sampul"><i className="fas fa-cog"></i></button>
+                            
+                            <button onClick={() => setShowFindTool(true)} className="p-2 text-[var(--text-primary)] bg-[var(--bg-tertiary)] hover:bg-[var(--accent-primary)] hover:text-white rounded" title="Cari & Ganti Kata"><i className="fas fa-search"></i></button>
+                            <button onClick={() => setShowDeleteConfirm(true)} title="Hapus Novel" className="p-2 text-red-400 hover:bg-red-900/30 rounded"><i className="fas fa-trash"></i></button>
+                        </div>
+                    </div>
+                </div>
+
+                <div className="flex-1 p-4 md:p-8 max-w-4xl mx-auto w-full">
+                    <div className="bg-[var(--bg-secondary)] rounded-xl shadow-xl min-h-[60vh] p-8 border border-[var(--bg-tertiary)] relative">
+                        <div className="mb-6 border-b border-[var(--bg-tertiary)] pb-4">
+                            {editingEpisodeId === currentEp?.id ? (
+                                <div className="flex items-center gap-2 mb-2">
+                                    <input type="text" value={editedEpisodeTitle} onChange={(e) => setEditedEpisodeTitle(e.target.value)} className="w-full bg-[var(--bg-primary)] text-[var(--text-primary)] text-3xl font-serif font-bold p-2 rounded outline-none border border-[var(--accent-primary)]" />
+                                    <button onClick={handleGenerateTitleSuggestions} disabled={isGeneratingTitles} className="p-3 bg-purple-600 text-white rounded hover:bg-purple-500 transition shadow-lg" title="Saran Judul (AI)">
+                                        {isGeneratingTitles ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-magic"></i>}
+                                    </button>
+                                </div>
+                            ) : (
+                                <h1 className="text-3xl font-serif font-bold text-[var(--text-primary)] mb-2">{currentEp ? currentEp.title : `Episode ${selectedEpisodeNumber}`}</h1>
+                            )}
+                        </div>
+
+                        {editingEpisodeId === currentEp?.id ? (
+                            <div className="flex flex-col gap-4">
+                                <textarea value={editedEpisodeContent} onChange={e => setEditedEpisodeContent(e.target.value)} className="w-full h-[60vh] bg-[var(--bg-primary)] text-[var(--text-primary)] p-4 rounded outline-none font-serif leading-relaxed text-lg resize-none" />
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setEditingEpisodeId(null)} className="px-4 py-2 rounded text-[var(--text-primary)]">Batal</button>
+                                    <button onClick={handleSaveEditedEpisode} className="px-4 py-2 bg-green-600 text-white rounded">Simpan</button>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="prose prose-invert max-w-none font-serif text-lg leading-loose text-[var(--text-primary)] whitespace-pre-wrap">
+                                {currentEpisodeContent || (
+                                    <div className="flex flex-col items-center justify-center py-10 opacity-70">
+                                        <p className="text-[var(--text-secondary)] italic mb-4">Episode ini belum ditulis. {currentEp?.plotOutline && `Alur: ${currentEp.plotOutline}`}</p>
+                                        <button onClick={handleContinueNextEpisode} disabled={loading} className="px-6 py-2 bg-[var(--accent-primary)] text-white rounded-lg shadow hover:bg-[var(--accent-secondary)] transition">
+                                            <i className="fas fa-magic mr-2"></i> Tulis Episode Ini (AI)
+                                        </button>
+                                    </div>
+                                )}
+
+                                {currentEpisodeContent && currentEp?.hashtags?.length > 0 && !currentEpisodeContent.includes('#suyatnoabubakar') && (
+                                    <div className="mt-6 pt-4 text-[var(--text-secondary)] opacity-80">
+                                        #suyatnoabubakar {currentEp.hashtags.map(t => t.trim().startsWith('#') ? t.trim() : `#${t.trim()}`).filter(t => t.toLowerCase() !== '#suyatnoabubakar').join(' ')}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="flex justify-between items-center mt-4 mb-4">
+                        <button 
+                            onClick={handlePrevEpisodeDetail} 
+                            disabled={!prevEp}
+                            className="px-4 py-2 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--accent-primary)] hover:text-white disabled:opacity-30 disabled:hover:bg-[var(--bg-tertiary)] disabled:cursor-not-allowed transition flex items-center gap-2"
+                        >
+                            <i className="fas fa-arrow-left"></i> Sebelumnya
+                        </button>
+                        
+                        <div className="flex gap-4 text-sm text-[var(--text-secondary)] font-mono opacity-80">
+                            <span><i className="fas fa-pen-nib mr-2"></i>{wordCountVal.toLocaleString('id-ID')} Kata</span>
+                            <span><i className="fas fa-text-width mr-2"></i>{charCount.toLocaleString('id-ID')} Karakter</span>
+                        </div>
+
+                        <button 
+                            onClick={handleNextEpisodeDetail} 
+                            disabled={!nextEp}
+                            className="px-4 py-2 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--accent-primary)] hover:text-white disabled:opacity-30 disabled:hover:bg-[var(--bg-tertiary)] disabled:cursor-not-allowed transition flex items-center gap-2"
+                        >
+                            Selanjutnya <i className="fas fa-arrow-right"></i>
+                        </button>
+                    </div>
+
+                    <div className="mt-4 flex flex-wrap gap-3">
+                        {currentEp && ( <button onClick={() => { setEditingEpisodeId(currentEp.id); setEditedEpisodeContent(currentEp.content); setEditedEpisodeTitle(currentEp.title); }} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-[var(--text-primary)] rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-[var(--bg-tertiary)]"><i className="fas fa-edit"></i> Edit Manual</button> )}
+                        {currentEp && currentEpisodeContent && ( <button onClick={() => setShowRegenerateConfirm(true)} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-yellow-500 rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-yellow-500/30"><i className="fas fa-sync-alt"></i> Regenerate</button> )}
+                        <button onClick={() => copyToClipboard(currentEpisodeContent, 'content')} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-[var(--text-primary)] rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-[var(--bg-tertiary)]"><i className={`fas ${copySuccess === 'content' ? 'fa-check text-green-500' : 'fa-copy'}`}></i> Salin</button>
+                        <button onClick={handleDownloadNovel} className="flex-1 min-w-[180px] p-3 bg-[var(--bg-secondary)] text-emerald-400 rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-emerald-900/50" title="Unduh semua episode novel yang sedang dibuka dalam satu file TXT"><i className="fas fa-file-download"></i> Unduh Novel (.txt)</button>
+                        <button onClick={handleDownloadCurrentEpisode} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-[var(--text-primary)] rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-[var(--bg-tertiary)]"><i className="fas fa-download"></i> Unduh Ep. (.txt)</button>
+                        
+                        {/* UPDATE: Ganti Unduh PDF Statis dengan Fitur Cetak/Editor Baru */}
+                        <button onClick={handlePreparePrint} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-green-400 hover:bg-green-900/30 rounded-lg flex items-center justify-center gap-2 border border-green-900/50 transition">
+                            <i className="fas fa-book"></i> Cetak / Editor Buku
+                        </button>
+                        
+                        <button onClick={handleGenerateSynopsis} disabled={isGeneratingSynopsis} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-purple-400 hover:text-purple-300 rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-purple-900/50"><i className="fas fa-book-reader"></i> Buat Sinopsis (AI)</button>
+                        {currentEp && ( <button onClick={() => setShowEpisodeDeleteConfirm(true)} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-red-400 hover:bg-red-900/30 rounded-lg flex items-center justify-center gap-2 border border-red-900/30"><i className="fas fa-trash-alt"></i> Hapus Ep.</button> )}
+                        
+                        {currentEp && (
+                            <button 
+                                onClick={() => handleGeneratePoster(currentEp)} 
+                                disabled={isGeneratingPosterPrompt}
+                                className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-pink-400 hover:text-pink-300 rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-pink-900/50"
+                            >
+                                <i className="fas fa-image"></i> Poster Episode (AI)
+                            </button>
+                        )}
+                    </div>
+                    
+                    <button onClick={handleEnterReaderMode} className="w-full mt-4 p-4 bg-yellow-600 hover:bg-yellow-500 text-white font-bold rounded-lg shadow-lg flex items-center justify-center gap-3 transition transform hover:scale-[1.02]">
+                        <i className="fas fa-book-open text-xl"></i> Baca Mode Buku (Full Screen)
+                    </button>
+
+                    <div className="mt-8 bg-[var(--bg-secondary)] p-6 rounded-xl border border-[var(--bg-tertiary)]">
+                        <h3 className="text-lg font-bold text-[var(--accent-primary)] mb-4">Lanjutkan Cerita (AI)</h3>
+                        <div className="mb-4">
+                            <label className="block text-xs text-[var(--text-secondary)] mb-1 uppercase tracking-wider font-bold">Target Panjang Kata</label>
+                            <select value={targetWordCount} onChange={(e) => setTargetWordCount(e.target.value)} className="w-full p-2 bg-[var(--bg-primary)] text-[var(--text-primary)] rounded border border-[var(--bg-tertiary)] text-sm">
+                                {wordCountOptions.map(opt => ( <option key={opt.value} value={opt.value}>{opt.label}</option> ))}
+                            </select>
+                        </div>
+                        <textarea value={nextEpisodePlotOutline} onChange={e => setNextEpisodePlotOutline(e.target.value)} placeholder="Tulis ringkasan singkat apa yang harus terjadi selanjutnya..." className="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] p-3 rounded mb-4 h-24 focus:ring-1 focus:ring-[var(--accent-primary)] outline-none" />
+                        <input type="text" value={charactersForNextEpisode} onChange={e => setCharactersForNextEpisode(e.target.value)} placeholder="Tokoh yang terlibat (pisahkan koma)" className="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] p-3 rounded mb-4 outline-none" />
+                        <button onClick={handleContinueNextEpisode} disabled={loading || !nextEpisodePlotOutline} className="w-full py-3 bg-[var(--accent-primary)] hover:bg-[var(--accent-secondary)] text-white font-bold rounded-lg shadow-lg transition disabled:opacity-50">
+                            {(!currentNovel?.episodes?.filter(e => e.content).length) ? "Tulis Episode 1" : "Tulis Episode Berikutnya"}
+                        </button>
+                        <button onClick={handleGeneratePlotIdea} disabled={isGeneratingPlot} className="w-full mt-3 py-2 bg-transparent border border-[var(--accent-primary)] text-[var(--accent-primary)] font-bold rounded-lg hover:bg-[var(--accent-primary)] hover:text-[var(--bg-primary)] transition">
+                            <i className="fas fa-lightbulb mr-2"></i> Minta Ide Lanjutan ke AI
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    const renderNovelList = () => (
+        <div className="p-4 max-w-6xl mx-auto">
+            <header className="flex justify-between items-center mb-8">
+                <div>
+                    <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-[var(--accent-primary)] to-[var(--accent-secondary)]">SATRIA NOVEL</h1>
+                    <div className="flex items-center gap-2">
+                        <p className="text-[var(--text-secondary)]">Platform Penulis Cerdas Berbasis AI</p>
+                        <span className="text-[10px] text-[var(--accent-primary)] border border-[var(--accent-primary)] px-1.5 rounded">{APP_VERSION}</span>
+                    </div>
+                </div>
+                <button onClick={() => setShowSettings(true)} className="p-3 bg-[var(--bg-tertiary)] rounded-full hover:bg-[var(--accent-primary)] hover:text-white transition">
+                    <i className="fas fa-cog text-xl"></i>
+                </button>
+            </header>
+
+            {novels.length === 0 && !loading && (
+                <div className="text-center py-12 bg-[var(--bg-secondary)] rounded-2xl border border-[var(--bg-tertiary)] mb-8">
+                    <i className="fas fa-book-open text-6xl text-[var(--accent-primary)] mb-4 opacity-50"></i>
+                    <h2 className="text-2xl font-bold text-[var(--text-primary)]">Belum ada novel</h2>
+                    <p className="text-[var(--text-secondary)]">Mulai perjalanan menulismu hari ini.</p>
+                </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+                {novels.map(novel => (
+                    <div key={novel.id} onClick={() => handleSelectNovel(novel)} className="group bg-[var(--bg-secondary)] p-5 rounded-xl border border-[var(--bg-tertiary)] hover:border-[var(--accent-primary)] cursor-pointer transition-all hover:-translate-y-1 shadow-lg relative overflow-hidden">
+                        <div className="absolute top-0 left-0 w-1 h-full bg-[var(--accent-primary)] opacity-0 group-hover:opacity-100 transition"></div>
+                        <h3 className="text-xl font-bold text-[var(--text-primary)] mb-2 truncate">{novel.title}</h3>
+                        <p className="text-sm text-[var(--text-secondary)] line-clamp-3 mb-4">{novel.openingPlot}</p>
+                        <div className="flex justify-between items-center text-xs text-[var(--text-secondary)]">
+                            <span className="bg-[var(--bg-primary)] px-2 py-1 rounded">{novel.genre || 'Umum'}</span>
+                            <span>{novel.authorName}</span>
+                        </div>
+                    </div>
+                ))}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <button onClick={() => { setView('createNovel'); resetCreateForm(); }} className="py-4 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold shadow-lg flex items-center justify-center gap-2">
+                    <i className="fas fa-pen-fancy"></i> Tulis Manual / AI
+                </button>
+                <button onClick={() => { setView('novelGenerator'); resetCreateForm(); }} className="py-4 rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white font-bold shadow-lg flex items-center justify-center gap-2">
+                    <i className="fas fa-magic"></i> Generator Otomatis
+                </button>
+                 <button onClick={() => { setView('importNovel'); setMessage(''); }} className="py-4 rounded-xl bg-[var(--bg-tertiary)] hover:bg-[var(--bg-secondary)] text-[var(--text-primary)] font-bold shadow-lg flex items-center justify-center gap-2 border border-[var(--bg-tertiary)]">
+                    <i className="fas fa-file-upload"></i> Impor File (.txt)
+                </button>
+            </div>
+        </div>
+    );
+
+    const renderBookEditor = () => {
+        if (!bookPrintData) return null;
+        const currentCover = coverImages[currentNovel?.id];
+        
+        // Helper function to calculate TOC preview dynamically
+        const getTocPreview = () => {
+            let currentPage = 6;
+            let charsPerPage = 1100;
+            if (printSettings.fontSize === '10pt') charsPerPage = 1400;
+            if (printSettings.fontSize === '12pt') charsPerPage = 900;
+            if (printSettings.lineHeight === '2.0') charsPerPage *= 0.9;
+            if (printSettings.lineHeight === '1.5') charsPerPage *= 1.1;
+
+            const tocItems = [];
+            bookPrintData.episodes.forEach(ep => {
+                if (ep.content && ep.content.length > 50) {
+                    let displayTitle = ep.title;
+                    const titleRegex = new RegExp(`^Episode\\s*${ep.episodeNumber}[:\\-\\s]*`, 'i');
+                    displayTitle = displayTitle.replace(titleRegex, '').trim();
+
+                    tocItems.push({ number: ep.episodeNumber, title: displayTitle, page: currentPage });
+                    const estimatedPages = Math.max(1, Math.ceil(ep.content.length / charsPerPage));
+                    currentPage += estimatedPages;
+                }
+            });
+            return tocItems;
+        };
+
+        const tocPreview = getTocPreview();
+        
+        return (
+            <div className="min-h-screen bg-[#e5e5e5] flex flex-col font-serif relative">
+                {/* Fixed Topbar */}
+                <div className="sticky top-0 bg-[var(--bg-secondary)] border-b border-[var(--bg-tertiary)] p-4 flex justify-between items-center z-50 shadow-lg">
+                    <button onClick={() => setView('novelDetail')} className="text-[var(--text-secondary)] hover:text-white flex items-center gap-2 font-sans font-bold">
+                        <i className="fas fa-arrow-left"></i> Kembali
+                    </button>
+                    <div className="flex flex-wrap justify-end gap-2 md:gap-3">
+                        <button onClick={handleSaveBookEdits} disabled={loading} className="px-3 py-2 text-sm md:text-base md:px-4 bg-blue-600 hover:bg-blue-500 text-white rounded font-sans font-bold transition shadow flex items-center gap-2">
+                            {loading ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-save"></i>} Simpan Editan
+                        </button>
+                        <button onClick={handleDownloadEPUB} disabled={loading} className="px-3 py-2 text-sm md:text-base md:px-4 bg-purple-600 hover:bg-purple-500 text-white rounded font-sans font-bold transition shadow-lg flex items-center gap-2">
+                            <i className="fas fa-file-export"></i> Unduh EPUB
+                        </button>
+                        <button onClick={handleExecutePrint} className="px-3 py-2 text-sm md:text-base md:px-6 bg-green-600 hover:bg-green-500 text-white rounded font-sans font-bold transition shadow-lg flex items-center gap-2">
+                            <i className="fas fa-print"></i> Cetak PDF
+                        </button>
+                    </div>
+                </div>
+
+                {/* Editor Scroll Area */}
+                <div className="flex-1 overflow-y-auto p-4 md:p-8 flex flex-col items-center gap-8 pb-32">
+                    
+                    {/* Settings Panel & Info Banner */}
+                    <div className="flex flex-col md:flex-row gap-4 w-full max-w-[160mm]">
+                        <div className="bg-blue-900/80 text-blue-100 p-4 rounded-lg text-sm flex-1 font-sans shadow-lg backdrop-blur-sm border border-blue-500/50">
+                            <p className="mb-2"><i className="fas fa-info-circle mr-2"></i> <b>Mode Editor Buku (A5 Layout)</b>.</p>
+                            <p className="text-xs opacity-80">Format *Drop Cap* (huruf besar di awal paragraf) dan halaman Hak Cipta akan otomatis diaplikasikan saat Anda mencetak PDF.</p>
+                        </div>
+                        <div className="bg-white text-black p-4 rounded-lg text-sm w-full md:w-auto font-sans shadow-lg border border-gray-300">
+                            <h4 className="font-bold mb-2 text-gray-700 border-b pb-1">Pengaturan Cetak (Print)</h4>
+                            <div className="flex flex-wrap gap-4">
+                                <div>
+                                    <label className="block text-xs text-gray-500 mb-1">Target Publikasi</label>
+                                    <select value={printSettings.formatTarget} onChange={e => setPrintSettings({...printSettings, formatTarget: e.target.value})} className="border p-1 rounded outline-none text-sm bg-blue-50 text-blue-800 font-bold">
+                                        <option value="playbooks">Google Play Books (Digital)</option>
+                                        <option value="physical">Buku Cetak Fisik (A5)</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-500 mb-1">Ukuran Huruf</label>
+                                    <select value={printSettings.fontSize} onChange={e => setPrintSettings({...printSettings, fontSize: e.target.value})} className="border p-1 rounded outline-none text-sm">
+                                        <option value="10pt">10pt (Kecil)</option>
+                                        <option value="11pt">11pt (Normal)</option>
+                                        <option value="12pt">12pt (Besar)</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-500 mb-1">Spasi Baris</label>
+                                    <select value={printSettings.lineHeight} onChange={e => setPrintSettings({...printSettings, lineHeight: e.target.value})} className="border p-1 rounded outline-none text-sm">
+                                        <option value="1.5">1.5 (Rapat)</option>
+                                        <option value="1.8">1.8 (Normal)</option>
+                                        <option value="2.0">2.0 (Longgar)</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Halaman Sampul Editor (Cover Upload) */}
+                    <div className="bg-white text-black p-10 shadow-2xl min-h-[210mm] w-full max-w-[148mm] flex flex-col items-center justify-center border border-gray-300 rounded-sm hover:ring-2 hover:ring-blue-400 transition-shadow duration-300 relative">
+                        <p className="font-sans text-xs text-gray-400 mb-4 tracking-widest uppercase text-center absolute top-10">Halaman Sampul (Cover)</p>
+                        
+                        {currentCover ? (
+                            <img src={currentCover} alt="Cover Buku" className="w-full h-auto max-h-[150mm] object-contain shadow-md mb-6 mt-10" />
+                        ) : (
+                            <div className="w-full flex-1 flex flex-col items-center justify-center text-gray-400 border-2 border-dashed border-gray-200 bg-gray-50 mb-6 mt-10 rounded">
+                                <i className="fas fa-image text-5xl mb-4 opacity-50"></i>
+                                <p className="font-sans text-sm font-bold mb-1">Belum ada gambar sampul</p>
+                                <p className="font-sans text-xs text-center px-4">Sampul akan muncul sebagai halaman paling awal saat PDF dicetak.</p>
+                            </div>
+                        )}
+                        
+                        <label className="cursor-pointer px-6 py-3 bg-indigo-600 hover:bg-indigo-500 text-white font-sans font-bold rounded shadow-lg transition flex items-center gap-2">
+                            <i className="fas fa-upload"></i> {currentCover ? 'Ganti Sampul' : 'Upload Sampul'}
+                            <input type="file" accept="image/*" className="hidden" onChange={handleUploadCover} />
+                        </label>
+                        <p className="font-sans text-[10px] text-gray-400 mt-3 text-center">*Ukuran maksimal 5MB. Disarankan gambar format potret/berdiri.</p>
+                    </div>
+
+                    {/* Halaman Judul Editor */}
+                    <div className="bg-white text-black p-12 shadow-2xl min-h-[210mm] w-full max-w-[148mm] flex flex-col items-center justify-center border border-gray-300 rounded-sm hover:ring-2 hover:ring-blue-400 transition-shadow duration-300">
+                        <p className="font-sans text-xs text-gray-400 mb-8 tracking-widest uppercase">Halaman Judul Utama</p>
+                        <textarea 
+                            value={bookPrintData.synopsis} 
+                            onChange={e => setBookPrintData({...bookPrintData, synopsis: e.target.value})} 
+                            className="w-full flex-1 outline-none resize-none text-justify leading-loose text-[11pt] bg-transparent font-serif" 
+                            placeholder="Tulis sinopsis di sini..." 
+                        />
+                    </div>
+
+                    {/* Halaman Hak Cipta (Preview) */}
+                    <div className="bg-white text-black p-10 shadow-2xl min-h-[210mm] w-full max-w-[148mm] flex flex-col items-center justify-center border border-gray-300 rounded-sm hover:ring-2 hover:ring-blue-400 transition-shadow duration-300 text-center relative">
+                        <p className="font-sans text-xs text-gray-400 absolute top-6 tracking-widest uppercase">Halaman Hak Cipta & Redaksi</p>
+                        
+                        <div className="w-full mt-10 bg-blue-50/50 p-4 border border-blue-100 rounded text-left font-sans text-xs mb-6 shadow-sm z-10">
+                            <p className="font-bold text-blue-800 mb-2 border-b border-blue-200 pb-1"><i className="fas fa-edit"></i> Edit Info Redaksi (Tampil di Cetakan)</p>
+                            <div className="space-y-2 mt-2">
+                                <div>
+                                    <label className="block text-gray-500 mb-1">Nama Penerbit:</label>
+                                    <input type="text" value={bookPrintData.publisher} onChange={e => setBookPrintData({...bookPrintData, publisher: e.target.value})} className="w-full border border-gray-300 p-1.5 rounded outline-none bg-white" />
+                                </div>
+                                <div>
+                                    <label className="block text-gray-500 mb-1">Tahun Terbit:</label>
+                                    <input type="text" value={bookPrintData.publishYear} onChange={e => setBookPrintData({...bookPrintData, publishYear: e.target.value})} className="w-full border border-gray-300 p-1.5 rounded outline-none bg-white" />
+                                </div>
+                                <div>
+                                    <label className="block text-gray-500 mb-1">Nomor ISBN (Opsional):</label>
+                                    <input type="text" value={bookPrintData.isbn} onChange={e => setBookPrintData({...bookPrintData, isbn: e.target.value})} className="w-full border border-gray-300 p-1.5 rounded outline-none bg-white" placeholder="Contoh: 978-602-XXX-XXX-X" />
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="opacity-80 text-sm leading-loose z-0 mt-2">
+                            <p className="font-bold text-lg mb-2">{bookPrintData.title}</p>
+                            <p>Karya: {bookPrintData.author}</p>
+                            <p>Penerbit: {bookPrintData.publisher}</p>
+                            <p>Tahun: {bookPrintData.publishYear}</p>
+                            {bookPrintData.isbn && <p className="font-bold">ISBN: {bookPrintData.isbn}</p>}
+                            <br/>
+                            <p>Hak Cipta &copy; {bookPrintData.publishYear} {bookPrintData.author}</p>
+                            <p>Hak cipta dilindungi oleh undang-undang.</p>
+                            <p>Dilarang memperbanyak sebagian atau seluruh isi buku ini tanpa izin tertulis.</p>
+                        </div>
+                    </div>
+
+                    {/* Daftar Isi Dinamis */}
+                    <div className="bg-white text-black p-10 shadow-2xl min-h-[210mm] w-full max-w-[148mm] flex flex-col border border-gray-300 rounded-sm hover:ring-2 hover:ring-blue-400 transition-shadow duration-300 relative">
+                        <p className="font-sans text-xs text-gray-400 mb-6 tracking-widest uppercase text-center">Daftar Isi (Otomatis)</p>
+                        <h2 className="text-center font-bold text-2xl mb-10 border-b-2 border-black pb-2">Daftar Isi</h2>
+                        <div className="flex-1 w-full flex flex-col gap-3">
+                            {tocPreview.length > 0 ? tocPreview.map((item, i) => (
+                                printSettings.formatTarget === 'playbooks' ? (
+                                    <div key={i} className="flex justify-start items-center w-full mb-2">
+                                        <span className="font-bold text-[14pt] text-blue-900 underline decoration-dotted underline-offset-4">Episode {item.number}: {item.title}</span>
+                                    </div>
+                                ) : (
+                                    <div key={i} className="flex justify-between items-end w-full">
+                                        <span className="font-bold bg-white pr-2 z-10">Episode {item.number}: {item.title}</span>
+                                        <span className="flex-1 border-b-2 border-dotted border-gray-400 mx-2 relative -top-1.5 z-0"></span>
+                                        <span className="font-bold bg-white pl-2 z-10">{item.page}</span>
+                                    </div>
+                                )
+                            )) : (
+                                <p className="text-center text-gray-400 mt-10">Belum ada konten episode.</p>
+                            )}
+                        </div>
+                        <p className="font-sans text-[10px] text-gray-400 absolute bottom-4 w-full text-center left-0">
+                            {printSettings.formatTarget === 'playbooks' 
+                                ? "*Format eBook: Daftar isi dirancang tanpa nomor halaman statis." 
+                                : "*Nomor halaman menyesuaikan pengaturan Cetak (Ukuran Huruf & Spasi)."
+                            }
+                        </p>
+                    </div>
+
+                    {/* Episodes Editor */}
+                    {bookPrintData.episodes.map((ep, idx) => (
+                        <div key={ep.id} className="bg-white text-black p-10 shadow-2xl min-h-[210mm] w-full max-w-[148mm] flex flex-col border border-gray-300 rounded-sm hover:ring-2 hover:ring-blue-400 transition-shadow duration-300">
+                            <p className="font-sans text-xs text-gray-400 mb-6 tracking-widest uppercase text-center">Isi Konten - Episode {ep.episodeNumber}</p>
+                            <input 
+                                type="text" 
+                                value={ep.title} 
+                                onChange={e => { 
+                                    const newEps = [...bookPrintData.episodes]; 
+                                    newEps[idx].title = e.target.value; 
+                                    setBookPrintData({...bookPrintData, episodes: newEps}); 
+                                }} 
+                                className="text-2xl font-bold mb-8 text-center w-full outline-none border-b-2 border-gray-200 pb-4 bg-transparent" 
+                                placeholder="Judul Episode" 
+                            />
+                            <textarea 
+                                value={ep.content} 
+                                onChange={e => { 
+                                    const newEps = [...bookPrintData.episodes]; 
+                                    newEps[idx].content = e.target.value; 
+                                    setBookPrintData({...bookPrintData, episodes: newEps}); 
+                                }} 
+                                className="w-full flex-1 outline-none resize-y text-justify leading-loose text-[11pt] whitespace-pre-wrap min-h-[200mm] bg-transparent font-serif" 
+                                placeholder="Isi cerita..." 
+                            />
+                        </div>
+                    ))}
+                </div>
+            </div>
+        );
+    }
+
+    const renderImportNovelView = () => (
+        <div className="p-4 max-w-2xl mx-auto text-center">
+            <button onClick={() => setView('novelList')} className="mb-6 text-[var(--text-secondary)] hover:text-white float-left"><i className="fas fa-arrow-left"></i> Kembali</button>
+            <div className="clear-both pt-6"></div>
+            <h2 className="text-3xl font-bold text-[var(--text-primary)] mb-6">Impor Novel (.txt)</h2>
+            <div className="bg-[var(--bg-secondary)] p-8 rounded-xl border border-[var(--bg-tertiary)]">
+                <i className="fas fa-file-alt text-6xl text-[var(--accent-primary)] mb-4"></i>
+                <div className="mb-6 text-[var(--text-secondary)] text-left bg-[var(--bg-primary)] p-4 rounded border border-[var(--bg-tertiary)] font-mono text-sm">
+                    <p className="mb-2 font-bold text-[var(--text-primary)]">Format yang disarankan:</p>
+                    <p>Judul: Nama Novel</p>
+                    <p>Penulis: Nama Anda</p>
+                    <p>Genre: Fantasi</p>
+                    <p className="text-[var(--accent-primary)]">Sinopsis: Tulis ringkasan cerita Anda di sini...</p>
+                    <br/>
+                    <p>=== EPISODE 1: Judul Episode ===</p>
+                    <p>Isi cerita...</p>
+                </div>
+                <label className="cursor-pointer bg-[var(--accent-primary)] hover:bg-[var(--accent-secondary)] text-white font-bold py-3 px-6 rounded-lg shadow-lg inline-block transition transform hover:scale-105">
+                    <i className="fas fa-upload mr-2"></i> Pilih File .txt
+                    <input type="file" className="hidden" accept=".txt,text/plain" onChange={handleFileImport} />
+                </label>
+            </div>
+        </div>
+    );
+
+    const renderNovelGenerator = () => (
+        <div className="p-4 max-w-4xl mx-auto">
+            <button onClick={() => setView('novelList')} className="mb-4 text-[var(--text-secondary)] hover:text-white"><i className="fas fa-arrow-left"></i> Kembali</button>
+            <h2 className="text-3xl font-bold text-[var(--text-primary)] mb-6 text-center">Generator Novel AI</h2>
+
+            <div className="flex justify-center mb-6">
+                <div className="bg-[var(--bg-secondary)] p-1 rounded-lg flex">
+                    <button onClick={() => setGeneratorView('search')} className={`px-6 py-2 rounded-md transition ${generatorView === 'search' ? 'bg-[var(--accent-primary)] text-white' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'}`}>Cari Ide</button>
+                    <button onClick={() => setGeneratorView('develop')} className={`px-6 py-2 rounded-md transition ${generatorView === 'develop' ? 'bg-[var(--accent-primary)] text-white' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'}`}>Kembangkan Alur</button>
+                </div>
+            </div>
+
+            {generatorView === 'search' && (
+                <div className="bg-[var(--bg-secondary)] p-6 rounded-xl border border-[var(--bg-tertiary)]">
+                    <h3 className="text-xl font-bold text-[var(--text-primary)] mb-4">Langkah 1: Cari Ide Cerita</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                        <input type="text" placeholder="Topik / Judul Kasar (Contoh: Misteri Candi Borobudur)" value={searchTitle} onChange={e => setSearchTitle(e.target.value)} className="p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg outline-none focus:ring-1 focus:ring-[var(--accent-primary)]" />
+                         <select value={storyType} onChange={e => { setStoryType(e.target.value); setEpicVersion(''); }} className="p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg">
+                            <option value="">Pilih Jenis Cerita</option>
+                            {storyTypeOptions.map(t => <option key={t} value={t}>{t}</option>)}
+                        </select>
+                    </div>
+                    {(storyType === 'Epos Mahabaratha' || storyType === 'Ramayana') && (
+                        <div className="mb-4 animate-fade-in">
+                            <label className="block text-sm text-[var(--text-secondary)] mb-1 font-bold text-[var(--accent-primary)]">Pilih Versi/Pakem Cerita</label>
+                            <select value={epicVersion} onChange={e => setEpicVersion(e.target.value)} className="w-full p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg border border-[var(--accent-primary)]">
+                                <option value="">-- Pilih Versi --</option>
+                                {epicVersionsOptions[storyType].map(ver => <option key={ver} value={ver}>{ver}</option>)}
+                            </select>
+                        </div>
+                    )}
+                    <button onClick={handleSearchPlotByTitle} disabled={loading} className="w-full py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg transition">Cari Ide Alur</button>
+                </div>
+            )}
+
+            {generatorView === 'develop' && (
+                <div className="bg-[var(--bg-secondary)] p-6 rounded-xl border border-[var(--bg-tertiary)]">
+                     <h3 className="text-xl font-bold text-[var(--text-primary)] mb-4">Langkah 2: Kembangkan & Siapkan</h3>
+                     
+                     <div className="flex justify-between items-end mb-2">
+                        <span className="text-sm text-[var(--text-secondary)]">Edit atau tempel alur cerita di bawah:</span>
+                        <label className="cursor-pointer text-xs font-bold bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--accent-primary)] hover:text-white px-3 py-1.5 rounded transition flex items-center gap-2 border border-[var(--bg-tertiary)]">
+                            <i className="fas fa-file-upload"></i> Upload File (.txt)
+                            <input type="file" accept=".txt,text/plain" className="hidden" onChange={handleUploadPlot} />
+                        </label>
+                     </div>
+
+                     <textarea value={fullPlot} onChange={e => setFullPlot(e.target.value)} placeholder="Alur cerita lengkap akan muncul di sini. Anda juga bisa menempelkan alur sendiri..." className="w-full h-64 bg-[var(--bg-tertiary)] text-[var(--text-primary)] p-4 rounded-lg mb-4 outline-none resize-none" />
+                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+                        <div className="md:col-span-1">
+                             <label className="block text-sm text-[var(--text-secondary)] mb-1">Judul Final</label>
+                             <input type="text" value={newNovelTitle} onChange={e => setNewNovelTitle(e.target.value)} className="w-full p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded"/>
+                        </div>
+                        <div>
+                             <label className="block text-sm text-[var(--text-secondary)] mb-1">Genre</label>
+                             <select value={newNovelGenre} onChange={e => { setNewNovelGenre(e.target.value); setEpicVersion(''); }} className="w-full p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded">
+                                <option value="">Pilih Genre</option>
+                                {genreOptions.map(g => <option key={g.name} value={g.name}>{g.name}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                             <label className="block text-sm text-[var(--text-secondary)] mb-1">Gaya Penulisan</label>
+                             <select value={writingStyle} onChange={e => setWritingStyle(e.target.value)} className="w-full p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded">
+                                {writingStyleOptions.map(ws => <option key={ws} value={ws}>{ws}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                             <label className="block text-sm text-[var(--text-secondary)] mb-1">Estimasi Episode</label>
+                             <input type="number" value={numEpisodesToGenerate} onChange={e => setNumEpisodesToGenerate(e.target.value)} className="w-full p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded"/>
+                        </div>
+                        
+                        {/* FOOTNOTE SETTING (GENERATOR) */}
+                        <div className="md:col-span-2 lg:col-span-4 mt-2">
+                             <label className="block text-sm text-[var(--text-secondary)] mb-1 font-bold">Catatan Kaki Akhir Episode (Opsional)</label>
+                             <textarea placeholder="Misal: Bersambung... Ditulis berdasarkan..." value={customFootnote} onChange={e => setCustomFootnote(e.target.value)} className="w-full p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded h-20 outline-none"/>
+                        </div>
+
+                     </div>
+                     {(newNovelGenre === 'Epos Mahabaratha' || newNovelGenre === 'Ramayana') && (
+                        <div className="mb-4 animate-fade-in">
+                            <label className="block text-sm text-[var(--text-secondary)] mb-1 font-bold text-[var(--accent-primary)]">Pilih Versi/Pakem Cerita</label>
+                            <select value={epicVersion} onChange={e => setEpicVersion(e.target.value)} className="w-full p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded border border-[var(--accent-primary)]">
+                                <option value="">-- Pilih Versi --</option>
+                                {epicVersionsOptions[newNovelGenre].map(ver => <option key={ver} value={ver}>{ver}</option>)}
+                            </select>
+                        </div>
+                    )}
+                     <button onClick={handlePrepareNovelFromPlot} disabled={loading || !fullPlot} className="w-full py-3 bg-green-600 hover:bg-green-500 text-white font-bold rounded-lg transition mt-4">Siapkan Novel & Episode (Placeholder)</button>
+                </div>
+            )}
+        </div>
+    );
+
+    const renderCreateNovel = () => (
+        <div className="p-4 max-w-2xl mx-auto">
+            <button onClick={() => setView('novelList')} className="mb-6 text-[var(--text-secondary)] hover:text-white"><i className="fas fa-arrow-left"></i> Kembali</button>
+            <h2 className="text-3xl font-bold text-[var(--text-primary)] mb-6">Buat Novel Baru (Manual)</h2>
+            <div className="bg-[var(--bg-secondary)] p-6 rounded-xl border border-[var(--bg-tertiary)] space-y-4">
+                <input type="text" placeholder="Judul Novel" value={newNovelTitle} onChange={e => setNewNovelTitle(e.target.value)} className="w-full p-4 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg outline-none focus:border-[var(--accent-primary)] border border-transparent text-lg font-bold" />
+                <div className="grid grid-cols-2 gap-4">
+                     <select value={newNovelGenre} onChange={e => { setNewNovelGenre(e.target.value); setEpicVersion(''); }} className="p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg">
+                        <option value="">Pilih Genre</option>
+                        {genreOptions.map(g => <option key={g.name} value={g.name}>{g.name}</option>)}
+                    </select>
+                     <select value={newNovelTone} onChange={e => setNewNovelTone(e.target.value)} className="p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg">
+                        <option value="">Pilih Nada</option>
+                        {toneOptions.map(t => <option key={t.name} value={t.name}>{t.name}</option>)}
+                    </select>
+                </div>
+                {(newNovelGenre === 'Epos Mahabaratha' || newNovelGenre === 'Ramayana') && (
+                    <div className="animate-fade-in">
+                        <label className="block text-sm text-[var(--text-secondary)] mb-1 font-bold text-[var(--accent-primary)]">Pilih Versi/Pakem Cerita</label>
+                        <select value={epicVersion} onChange={e => setEpicVersion(e.target.value)} className="w-full p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg border border-[var(--accent-primary)]">
+                            <option value="">-- Pilih Versi --</option>
+                            {epicVersionsOptions[newNovelGenre].map(ver => <option key={ver} value={ver}>{ver}</option>)}
+                        </select>
+                    </div>
+                )}
+                <div>
+                     <label className="block text-sm text-[var(--text-secondary)] mb-1 font-bold">Gaya Penulisan</label>
+                     <select value={writingStyle} onChange={e => setWritingStyle(e.target.value)} className="w-full p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg">
+                        {writingStyleOptions.map(ws => <option key={ws} value={ws}>{ws}</option>)}
+                    </select>
+                </div>
+                <textarea placeholder="Alur Pembuka / Sinopsis Awal..." value={newNovelOpeningPlot} onChange={e => setNewNovelOpeningPlot(e.target.value)} className="w-full p-4 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg h-32 outline-none" />
+                <div className="bg-[var(--bg-primary)] p-4 rounded-lg border border-[var(--bg-tertiary)]">
+                    <p className="text-sm text-[var(--text-secondary)] mb-2 font-bold"><i className="fas fa-random"></i> Adaptasi Cerita (Opsional)</p>
+                    <div className="grid grid-cols-2 gap-2 mb-2">
+                        <select value={adaptLocation} onChange={handleAdaptLocationChange} className="p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded text-sm">
+                            <option value="">Lokasi</option>
+                            {indonesianLocationsAndEras.map(l => <option key={l.region} value={l.region}>{l.region}</option>)}
+                        </select>
+                        <select value={adaptEra} onChange={e => setAdaptEra(e.target.value)} disabled={!adaptLocation} className="p-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded text-sm">
+                            <option value="">Era</option>
+                            {availableEras.map(e => <option key={e} value={e}>{e}</option>)}
+                        </select>
+                    </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                     <select value={authorNameSelection} onChange={e => setAuthorNameSelection(e.target.value)} className="p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg">
+                        {customAuthors.map(n => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                </div>
+                <div>
+                     <label className="block text-sm text-[var(--text-secondary)] mb-1">Target Panjang Episode Awal</label>
+                     <select value={targetWordCount} onChange={(e) => setTargetWordCount(e.target.value)} className="w-full p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg">
+                        {wordCountOptions.map(opt => ( <option key={opt.value} value={opt.value}>{opt.label}</option> ))}
+                    </select>
+                </div>
+                
+                {/* FOOTNOTE SETTING (MANUAL) */}
+                <div>
+                     <label className="block text-sm text-[var(--text-secondary)] mb-1 font-bold">Catatan Kaki Akhir Episode (Opsional)</label>
+                     <textarea placeholder="Misal: Bersambung... Ditulis berdasarkan referensi..." value={customFootnote} onChange={e => setCustomFootnote(e.target.value)} className="w-full p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg h-24 outline-none" />
+                </div>
+
+                <button onClick={handleCreateNovel} disabled={loading} className="w-full py-4 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-400 hover:to-emerald-500 text-white font-bold rounded-xl shadow-lg transition transform hover:scale-[1.02]">Buat Novel & Episode 1</button>
+            </div>
+        </div>
+    );
+
+    return (
+        <Fragment>
+            <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] font-sans transition-colors duration-300">
+                {message && !loading && ( <div className="fixed top-4 left-1/2 transform -translate-x-1/2 bg-[var(--accent-primary)] text-[var(--bg-primary)] px-6 py-3 rounded-full shadow-xl z-50 font-bold animate-bounce">{message}</div> )}
+                {!userId ? (
+                    <div className="flex h-screen items-center justify-center flex-col">
+                        <i className="fas fa-circle-notch fa-spin text-4xl text-[var(--accent-primary)] mb-4"></i>
+                        <p>Menghubungkan ke Satria Novel Server...</p>
+                    </div>
+                ) : (
+                    <Fragment>
+                        {view === 'novelList' && renderNovelList()}
+                        {view === 'createNovel' && renderCreateNovel()}
+                        {view === 'novelDetail' && renderNovelDetail()}
+                        {view === 'reader' && renderReaderMode()}
+                        {view === 'novelGenerator' && renderNovelGenerator()}
+                        {view === 'importNovel' && renderImportNovelView()}
+                        {view === 'bookEditor' && renderBookEditor()}
+                    </Fragment>
+                )}
+                {loading && renderGlobalLoading()}
+                {showSettings && renderSettingsModal()}
+                {showNovelSettings && renderNovelSettings()}
+                {showPosterPromptModal && (
+                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                        <div className="bg-[var(--bg-secondary)] p-6 rounded-xl w-full max-w-2xl border border-[var(--bg-tertiary)]">
+                            <h3 className="text-xl font-bold mb-4">Prompt Poster</h3>
+                            <textarea readOnly value={activePosterPrompt} className="w-full h-32 bg-[var(--bg-primary)] p-3 rounded mb-4 text-sm font-mono"/>
+                            <div className="flex justify-end gap-3">
+                                <button onClick={() => setShowPosterPromptModal(false)} className="px-4 py-2 bg-gray-600 rounded">Tutup</button>
+                                <button onClick={() => copyToClipboard(activePosterPrompt, 'posterPrompt')} className="px-6 py-2 font-bold rounded transition bg-[var(--accent-primary)] text-[var(--bg-primary)]">
+                                    {copySuccess === 'posterPrompt' ? <><i className="fas fa-check-circle mr-2"></i>Tersalin!</> : "Salin Prompt"}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+                
+                {showTitleModal && (
+                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                        <div className="bg-[var(--bg-secondary)] p-6 rounded-xl w-full max-w-md border border-[var(--bg-tertiary)] shadow-2xl">
+                            <h3 className="text-xl font-bold mb-4 text-[var(--text-primary)]">Pilih Judul Episode</h3>
+                            <p className="text-sm text-[var(--text-secondary)] mb-4">Berikut ide judul dari AI berdasarkan isi cerita:</p>
+                            <div className="space-y-2 max-h-[60vh] overflow-y-auto mb-4">
+                                {generatedTitles.map((t, i) => (
+                                    <button key={i} onClick={() => { setEditedEpisodeTitle(t); setShowTitleModal(false); }} className="w-full text-left p-3 rounded bg-[var(--bg-primary)] hover:bg-[var(--bg-tertiary)] border border-[var(--bg-tertiary)] transition hover:border-[var(--accent-primary)] text-sm font-bold text-[var(--text-primary)]">
+                                        {t}
+                                    </button>
+                                ))}
+                            </div>
+                            <button onClick={() => setShowTitleModal(false)} className="w-full py-2 bg-gray-600 hover:bg-gray-500 rounded text-white font-bold transition">Tutup</button>
+                        </div>
+                    </div>
+                )}
+
+                {showDeleteConfirm && (
+                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                        <div className="bg-[var(--bg-secondary)] p-6 rounded-xl text-center border border-[var(--bg-tertiary)]">
+                            <i className="fas fa-exclamation-triangle text-4xl text-[var(--danger)] mb-4"></i>
+                            <h3 className="text-xl font-bold mb-2">Hapus Novel?</h3>
+                            <p className="text-[var(--text-secondary)] mb-6">Tindakan ini tidak dapat dibatalkan.</p>
+                            <div className="flex justify-center gap-4">
+                                <button onClick={() => setShowDeleteConfirm(false)} className="px-4 py-2 bg-gray-600 rounded">Batal</button>
+                                <button onClick={handleDeleteNovel} className="px-4 py-2 bg-[var(--danger)] text-white rounded font-bold">Hapus</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+                {showEpisodeDeleteConfirm && (
+                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                        <div className="bg-[var(--bg-secondary)] p-6 rounded-xl text-center border border-[var(--bg-tertiary)] max-w-sm w-full">
+                            <i className="fas fa-trash-alt text-4xl text-[var(--danger)] mb-4"></i>
+                            <h3 className="text-xl font-bold mb-2">Hapus Episode {selectedEpisodeNumber}?</h3>
+                            <p className="text-[var(--text-secondary)] mb-6 text-sm">Konten episode ini akan hilang permanen.</p>
+                            <div className="flex justify-center gap-3">
+                                <button onClick={() => setShowEpisodeDeleteConfirm(false)} className="px-4 py-2 bg-gray-600 rounded">Batal</button>
+                                <button onClick={handleDeleteEpisode} className="px-4 py-2 bg-[var(--danger)] text-white rounded font-bold">Ya, Hapus</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+                {showRegenerateConfirm && (
+                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                        <div className="bg-[var(--bg-secondary)] p-6 rounded-xl text-center border border-[var(--bg-tertiary)] max-w-sm w-full">
+                            <i className="fas fa-sync-alt text-4xl text-yellow-500 mb-4 animate-spin-slow"></i>
+                            <h3 className="text-xl font-bold mb-2">Tulis Ulang Episode?</h3>
+                            <p className="text-[var(--text-secondary)] mb-6 text-sm">AI akan menulis ulang <b>Episode {selectedEpisodeNumber}</b>. <br/> <span className="text-[var(--danger)]">Konten lama akan tertimpa.</span></p>
+                             <div className="mb-6 text-left">
+                                <label className="block text-xs text-[var(--text-secondary)] mb-1 uppercase tracking-wider font-bold">Target Panjang</label>
+                                <select value={targetWordCount} onChange={(e) => setTargetWordCount(e.target.value)} className="w-full p-2 bg-[var(--bg-primary)] text-[var(--text-primary)] rounded border border-[var(--bg-tertiary)] text-sm">
+                                    {wordCountOptions.map(opt => ( <option key={opt.value} value={opt.value}>{opt.label}</option> ))}
+                                </select>
+                            </div>
+                            <div className="flex justify-center gap-3">
+                                <button onClick={() => setShowRegenerateConfirm(false)} className="px-4 py-2 bg-gray-600 rounded">Batal</button>
+                                <button onClick={handleConfirmRegenerate} className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 text-white rounded font-bold">Ya, Tulis Ulang</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+                {showFindTool && (
+                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                        <div className="bg-[var(--bg-secondary)] p-6 rounded-xl w-full max-w-2xl border border-[var(--bg-tertiary)] h-[80vh] flex flex-col">
+                            <div className="flex justify-between items-center mb-4 border-b border-[var(--bg-tertiary)] pb-2">
+                                <h3 className="text-xl font-bold"><i className="fas fa-search mr-2"></i>Cari & Ganti Kata</h3>
+                                <button onClick={() => setShowFindTool(false)} className="text-[var(--text-secondary)] hover:text-white"><i className="fas fa-times text-xl"></i></button>
+                            </div>
+                            <div className="flex gap-2 mb-4">
+                                <input type="text" placeholder="Masukkan kata yang dicari..." value={findKeyword} onChange={e => setFindKeyword(e.target.value)} className="flex-1 p-3 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded outline-none" />
+                                <button onClick={handleSearchWords} className="px-6 py-2 bg-[var(--accent-primary)] text-white font-bold rounded">{isSearchingWords ? <i className="fas fa-spinner fa-spin"></i> : "Cari"}</button>
+                            </div>
+                            <div className="flex-1 overflow-y-auto pr-2 space-y-3">
+                                {foundMatches.length === 0 && findKeyword && !isSearchingWords && ( <p className="text-center text-[var(--text-secondary)] mt-10">Kata tidak ditemukan.</p> )}
+                                {foundMatches.map((match, idx) => (
+                                    <div key={idx} className="bg-[var(--bg-primary)] p-4 rounded border border-[var(--bg-tertiary)]">
+                                        <p className="text-sm text-[var(--text-secondary)] mb-3 italic">"{match.context}"</p>
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <button onClick={() => performReplace(idx, '')} className="px-3 py-1 bg-red-900/40 text-red-300 text-xs rounded hover:bg-red-900/60 border border-red-900/50">Hapus</button>
+                                            <div className="flex items-center gap-1 bg-[var(--bg-tertiary)] rounded px-2 py-1">
+                                                <input type="text" placeholder="Ganti Manual" value={manualReplaceInput[idx] || ''} onChange={(e) => setManualReplaceInput(prev => ({...prev, [idx]: e.target.value}))} className="bg-transparent text-[var(--text-primary)] text-xs w-24 outline-none" />
+                                                <button onClick={() => performReplace(idx, manualReplaceInput[idx])} disabled={!manualReplaceInput[idx]} className="text-[var(--accent-primary)] hover:text-white disabled:opacity-30"><i className="fas fa-check"></i></button>
+                                            </div>
+                                            <button onClick={() => handleAIWordSuggestion(idx)} className="px-3 py-1 bg-purple-900/40 text-purple-300 text-xs rounded hover:bg-purple-900/60 border border-purple-900/50"><i className="fas fa-magic mr-1"></i> Saran AI</button>
+                                        </div>
+                                        {aiWordSuggestions[idx] && (
+                                            <div className="mt-3 flex flex-wrap gap-2 animate-fade-in">
+                                                <span className="text-xs text-[var(--text-secondary)]">Saran:</span>
+                                                {aiWordSuggestions[idx].map((word, wIdx) => ( <button key={wIdx} onClick={() => performReplace(idx, word)} className="px-2 py-1 bg-[var(--accent-primary)] text-white text-xs rounded hover:opacity-80">{word}</button> ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                            <p className="text-xs text-[var(--text-secondary)] mt-2 text-center">*Mengedit kata akan secara otomatis mengaktifkan mode Edit Manual dan memperbarui konten.</p>
+                        </div>
+                    </div>
+                )}
+                {showSynopsisModal && (
+                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                        <div className="bg-[var(--bg-secondary)] p-6 rounded-xl w-full max-w-2xl border border-[var(--bg-tertiary)] shadow-2xl h-[85vh] flex flex-col">
+                            <div className="flex justify-between items-center mb-4">
+                                <h3 className="text-xl font-bold text-[var(--text-primary)]"><i className="fas fa-feather-alt mr-2 text-purple-400"></i>Sinopsis Cerita (AI)</h3>
+                                <button onClick={() => setShowSynopsisModal(false)} className="text-[var(--text-secondary)] hover:text-white"><i className="fas fa-times text-xl"></i></button>
+                            </div>
+                            <p className="text-sm text-[var(--text-secondary)] mb-2">AI telah menganalisis bab awal, tengah, dan akhir novel Anda untuk membuat blurb promosi ini. Silakan edit jika perlu.</p>
+                            <textarea value={generatedSynopsis} onChange={(e) => setGeneratedSynopsis(e.target.value)} className="w-full flex-1 bg-[var(--bg-primary)] p-4 rounded-lg outline-none border border-[var(--bg-tertiary)] focus:border-purple-500 font-serif leading-relaxed resize-none mb-4 text-base" />
+                            <div className="flex justify-end gap-3">
+                                <button onClick={() => copyToClipboard(generatedSynopsis, 'synopsis')} className="px-4 py-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded hover:bg-gray-600 transition"><i className={`fas ${copySuccess === 'synopsis' ? 'fa-check text-green-500' : 'fa-copy'}`}></i> Salin</button>
+                                <button onClick={handleSaveSynopsis} className="px-6 py-2 bg-purple-600 hover:bg-purple-500 text-white font-bold rounded transition">Simpan Sebagai Sinopsis Utama</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </div>
+            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+        </Fragment>
+    );
+}
+
+export default App;
