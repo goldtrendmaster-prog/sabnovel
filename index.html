@@ -773,64 +773,29 @@ function App() {
         reader.readAsText(file);
     };
 
-    const triggerTextDownload = (fileContent, fileName) => {
-        // BOM membantu aplikasi teks mengenali karakter Bahasa Indonesia/Unicode dengan benar.
-        const blob = new Blob(["\uFEFF", fileContent], { type: 'text/plain;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = fileName;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        // Jangan revoke terlalu cepat agar browser sempat memulai unduhan.
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
-    };
-
-    const getSafeNovelFileName = (title) => (title || 'novel')
-        .normalize('NFKD')
-        .replace(/[^a-z0-9]+/gi, '_')
-        .replace(/^_+|_+$/g, '')
-        .toLowerCase() || 'novel';
-
     const handleDownloadNovel = () => {
-        if (!currentNovel) return;
-        const episodes = [...(currentNovel.episodes || [])]
-            .sort((a, b) => (a.episodeNumber || 0) - (b.episodeNumber || 0));
-        if (episodes.length === 0) {
-            setMessage('Novel ini belum memiliki episode untuk diunduh.');
-            return;
-        }
-
-        const fileContent = [
-            `Judul Novel: ${currentNovel.title || 'Tanpa Judul'}`,
-            `Penulis: ${currentNovel.authorName || 'Tidak diketahui'}`,
-            `Genre: ${currentNovel.genre || 'Umum'}`,
-            currentNovel.openingPlot ? `Sinopsis:\n${currentNovel.openingPlot}` : '',
-            '',
-            ...episodes.flatMap(ep => [
-                `=== EPISODE ${ep.episodeNumber || ''}: ${ep.title || `Episode ${ep.episodeNumber || ''}`} ===`,
-                '',
-                (ep.content || '').trim() || '(Episode ini belum ditulis)',
-                '',
-                ''
-            ])
-        ].filter((line, index, arr) => !(line === '' && arr[index - 1] === '' && arr[index + 1] === ''))
-         .join('\n').trim() + '\n';
-
-        triggerTextDownload(fileContent, `${getSafeNovelFileName(currentNovel.title)}.txt`);
-        setMessage(`Novel berhasil diunduh dalam format TXT (${episodes.length} episode).`);
-    };
-
-    const handleDownloadCurrentEpisode = () => {
         if (!currentNovel || !currentNovel.episodes) return;
         const currentEp = currentNovel.episodes.find(e => e.episodeNumber === selectedEpisodeNumber);
         if (!currentEp) {
-            setMessage('Episode tidak ditemukan atau belum dipilih.');
-            return;
+             setMessage("Episode tidak ditemukan atau belum dipilih.");
+             return;
         }
-        const fileContent = `Judul Novel: ${currentNovel.title || 'Tanpa Judul'}\nPenulis: ${currentNovel.authorName || 'Tidak diketahui'}\n\n=== EPISODE ${currentEp.episodeNumber}: ${currentEp.title || ''} ===\n\n${currentEp.content || '(Episode ini belum ditulis)'}\n`;
-        triggerTextDownload(fileContent, `${getSafeNovelFileName(currentNovel.title)}_Episode_${currentEp.episodeNumber}.txt`);
+
+        let fileContent = `Judul Novel: ${currentNovel.title}\n`;
+        fileContent += `Penulis: ${currentNovel.authorName}\n\n`;
+        fileContent += `=== EPISODE ${currentEp.episodeNumber}: ${currentEp.title} ===\n\n`;
+        fileContent += `${currentEp.content || "(Episode ini belum ditulis)"}\n`;
+
+        const blob = new Blob([fileContent], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const cleanTitle = currentNovel.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        a.download = `${cleanTitle}_Episode_${currentEp.episodeNumber}.txt`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
         setMessage(`Episode ${currentEp.episodeNumber} berhasil diunduh.`);
     };
     
@@ -1674,49 +1639,30 @@ Format Output JSON: { "title": "Judul Episode Baru", "content": "Isi Cerita Leng
         setMessage("Merancang prompt poster episode...");
         
         try {
-            const characters = episode.charactersInvolved && episode.charactersInvolved.length > 0
-                ? episode.charactersInvolved.join(', ')
-                : (Array.isArray(currentNovel.mainCharacters) && currentNovel.mainCharacters.length > 0
-                    ? currentNovel.mainCharacters.join(', ')
-                    : 'tokoh yang disebutkan dalam cerita');
+            const characters = episode.charactersInvolved && episode.charactersInvolved.length > 0 
+                ? episode.charactersInvolved.join(', ') 
+                : (currentNovel.mainCharacters ? currentNovel.mainCharacters.join(', ') : "Main Character");
+            
+            const genrePrompt = currentNovel.genre || 'Cinematic';
+            const sceneSnippet = episode.content ? episode.content.slice(0, 800) : episode.plotOutline;
 
-            const genrePrompt = currentNovel.genre || 'Drama';
-            const novelTitle = currentNovel.title || 'Tanpa judul';
-            const episodeTitle = episode.title || `Episode ${episode.episodeNumber}`;
-            const episodeNumberLabel = `#${String(Number(episode.episodeNumber) || 1).padStart(2, '0')}`;
-            const authorLabel = currentNovel.authorName || currentNovel.author || 'Nama Penulis';
-            const sceneSnippet = [
-                episode.plotOutline ? `Rangkuman alur episode: ${episode.plotOutline}` : '',
-                episode.content ? `Isi episode: ${episode.content.slice(0, 1800)}` : ''
-            ].filter(Boolean).join('\n\n') || 'Belum ada isi episode. Buat visual berdasarkan judul episode dan genre, tanpa mengarang detail plot yang spesifik.';
-
-            const prompt = `Peran: Ahli prompt ilustrasi sinematik untuk sampul episode novel.
-Tugas: Tulis SATU prompt visual final dalam Bahasa Indonesia untuk menghasilkan sampul/poster episode yang menarik, kuat secara emosional, dan benar-benar sesuai dengan peristiwa dalam episode.
-
-DATA CERITA:
-- Judul novel yang wajib ditampilkan: ${novelTitle}
-- Nomor episode yang wajib ditampilkan: ${episodeNumberLabel}
-- Judul episode yang wajib ditampilkan: ${episodeTitle}
-- Nama penulis yang wajib ditampilkan: ${authorLabel}
-- Genre: ${genrePrompt}
-- Tokoh yang terlibat (gunakan nama saja): ${characters}
-- Rangkuman/teks episode:
-${sceneSnippet}
-
-ARAHAN WAJIB:
-1. Tentukan satu momen paling dramatis, emosional, misterius, romantis, menegangkan, atau menentukan dari isi episode. Jadikan momen itu fokus utama ilustrasi; jangan membuat adegan generik yang tidak berhubungan dengan cerita.
-2. Gambarkan latar tempat, waktu, cuaca, pencahayaan, suasana, aksi, ekspresi emosi, komposisi, sudut kamera, kedalaman bidang, dan palet warna sesuai petunjuk yang benar-benar ada dalam cerita. Jika detail tidak disebutkan, pilih detail visual yang masuk akal berdasarkan konteks dan genre tanpa mengubah alur.
-3. Tokoh harus disebut dengan NAMA saja: ${characters}. Jangan menjelaskan atau mengarang ciri fisik, pakaian, usia, rambut, warna kulit, atau bentuk wajah tokoh karena setiap tokoh akan dibuat menggunakan gambar referensi. Tegaskan agar identitas/penampilan tokoh mengikuti gambar referensi yang diberikan.
-4. Buat komposisi sampul episode profesional dengan fokus visual jelas, dramatis, sinematik, detail tinggi, pencahayaan terarah, tata letak rapi, dan kualitas ilustrasi premium. Sisakan ruang yang cukup untuk teks agar tidak menutupi adegan utama. Hindari visual berantakan, anatomi cacat, anggota tubuh tambahan, watermark, dan teks acak.
-5. Tampilkan EMPAT elemen teks ini dengan ejaan persis seperti yang diberikan dan hierarki tata letak berikut:
-   - PALING ATAS: nomor episode “${episodeNumberLabel}”, tepat di atas judul novel, ukuran kecil hingga sedang tetapi jelas terbaca.
-   - DI BAWAH NOMOR EPISODE: judul novel “${novelTitle}” sebagai judul utama di bagian atas sampul, ukuran paling besar, paling menonjol, dengan tipografi profesional yang sesuai genre.
-   - TEPAT DI BAWAH JUDUL NOVEL: judul episode “${episodeTitle}”, ukuran lebih kecil daripada judul novel tetapi tetap jelas terbaca.
-   - BAGIAN BAWAH TENGAH SAMPUL: nama penulis “${authorLabel}”, ukuran kecil, rapi, elegan, dan tetap terbaca.
-   Atur semua teks secara terpusat dan berjenjang, dengan jarak yang seimbang serta kontras memadai terhadap latar. Pastikan nomor episode berada di atas judul novel, bukan di samping atau di bawahnya. Nama penulis harus berada di bawah tengah, bukan di pojok. Jangan menghilangkan, mengganti, menerjemahkan, atau salah mengeja keempat teks tersebut. Jangan tambahkan teks lain, tagline, label, atau tulisan dekoratif.
-6. Seluruh prompt harus berbahasa Indonesia, ringkas tetapi spesifik dan siap langsung disalin ke generator gambar. Jangan sertakan penjelasan, pengantar, daftar analisis, atau tanda kutip pembungkus.
-
-KELUARAN: Hanya satu prompt final berbahasa Indonesia.`;
+            const prompt = `Peran: Prompt Engineer untuk AI Art (Midjourney/DALL-E).
+            Tugas: Buat prompt lengkap dalam Bahasa Inggris untuk poster film dari episode novel.
+            
+            Data:
+            - Judul Novel: "${currentNovel.title}"
+            - Judul Episode: "${episode.title}"
+            - Genre: ${genrePrompt}
+            - Karakter Utama di Scene ini: ${characters}
+            - Cuplikan Cerita: ${sceneSnippet}
+            
+            Instruksi Visual:
+            1. Deskripsikan adegan kunci dari cuplikan cerita di atas dengan sangat detail, atmosferik, dan gaya artistik (Cinematic/8k/Unreal Engine 5).
+            2. WAJIB MENAMPILKAN KARAKTER: Deskripsikan penampilan fisik karakter "${characters}" sesuai dengan genre.
+            3. TEKS (TYPOGRAPHY): Instruksikan agar gambar memuat teks JUDUL NOVEL "${currentNovel.title}" (besar/mencolok) dan JUDUL EPISODE "${episode.title}" (lebih kecil/subtitle).
+            
+            Output:
+            Hanya berikan teks prompt final dalam Bahasa Inggris.`;
 
             const res = await callGeminiAPI(prompt, setIsGeneratingPosterPrompt);
             setActivePosterPrompt(res);
@@ -2052,8 +1998,7 @@ KELUARAN: Hanya satu prompt final berbahasa Indonesia.`;
                         {currentEp && ( <button onClick={() => { setEditingEpisodeId(currentEp.id); setEditedEpisodeContent(currentEp.content); setEditedEpisodeTitle(currentEp.title); }} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-[var(--text-primary)] rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-[var(--bg-tertiary)]"><i className="fas fa-edit"></i> Edit Manual</button> )}
                         {currentEp && currentEpisodeContent && ( <button onClick={() => setShowRegenerateConfirm(true)} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-yellow-500 rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-yellow-500/30"><i className="fas fa-sync-alt"></i> Regenerate</button> )}
                         <button onClick={() => copyToClipboard(currentEpisodeContent, 'content')} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-[var(--text-primary)] rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-[var(--bg-tertiary)]"><i className={`fas ${copySuccess === 'content' ? 'fa-check text-green-500' : 'fa-copy'}`}></i> Salin</button>
-                        <button onClick={handleDownloadNovel} className="flex-1 min-w-[180px] p-3 bg-[var(--bg-secondary)] text-emerald-400 rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-emerald-900/50" title="Unduh semua episode novel yang sedang dibuka dalam satu file TXT"><i className="fas fa-file-download"></i> Unduh Novel (.txt)</button>
-                        <button onClick={handleDownloadCurrentEpisode} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-[var(--text-primary)] rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-[var(--bg-tertiary)]"><i className="fas fa-download"></i> Unduh Ep. (.txt)</button>
+                        <button onClick={handleDownloadNovel} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-[var(--text-primary)] rounded-lg hover:bg-[var(--bg-tertiary)] flex items-center justify-center gap-2 border border-[var(--bg-tertiary)]"><i className="fas fa-download"></i> Unduh Ep. (.txt)</button>
                         
                         {/* UPDATE: Ganti Unduh PDF Statis dengan Fitur Cetak/Editor Baru */}
                         <button onClick={handlePreparePrint} className="flex-1 min-w-[140px] p-3 bg-[var(--bg-secondary)] text-green-400 hover:bg-green-900/30 rounded-lg flex items-center justify-center gap-2 border border-green-900/50 transition">
